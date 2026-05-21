@@ -103,7 +103,9 @@ export default function App() {
   const [editMode, setEditMode] = useState(false);
   const [editingTask, setEditingTask] = useState(null); // { id, title, description, practicalGuide }
   const [editingPhase, setEditingPhase] = useState(null); // index being renamed
-  const [dragState, setDragState] = useState(null); // { taskId, overTaskId, phaseIdx }
+  // Drag state uses refs (no re-render) + a single visual indicator state
+  const dragRef = useRef(null); // { taskId, phaseIdx }
+  const [dragOverId, setDragOverId] = useState(null); // just for visual highlight
   const [backupCount, setBackupCount] = useState(0);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importText, setImportText] = useState("");
@@ -389,40 +391,47 @@ export default function App() {
     await applyStructureChange(newStructure);
   };
 
-  // ─── DRAG & DROP ─────────────────────────────────────────────────────────────
-  const handleDragStart = (e, taskId) => {
-    setDragState({ taskId, overTaskId: null });
+  // ─── DRAG & DROP (ref-based, no re-render during drag) ───────────────────────
+  const handleDragStart = (e, taskId, phaseIdx) => {
+    dragRef.current = { taskId, phaseIdx };
     e.dataTransfer.effectAllowed = "move";
+    // Store taskId in dataTransfer as fallback
+    e.dataTransfer.setData("text/plain", taskId);
   };
 
   const handleDragOver = (e, overTaskId) => {
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
-    setDragState((d) => d ? { ...d, overTaskId } : d);
+    // Only update visual state if it changed (avoids unnecessary renders)
+    setDragOverId((prev) => prev === overTaskId ? prev : overTaskId);
   };
 
   const handleDrop = async (e, overTaskId, phaseIdx) => {
     e.preventDefault();
-    if (!dragState || dragState.taskId === overTaskId) {
-      setDragState(null);
-      return;
-    }
+    setDragOverId(null);
+    const drag = dragRef.current;
+    dragRef.current = null;
+    if (!drag || drag.taskId === overTaskId) return;
+    // Only allow reorder within the same phase
+    if (drag.phaseIdx !== phaseIdx) return;
     const section = structure[phaseIdx];
     const taskIds = section.tasks.map((t) => t.id);
-    const fromIdx = taskIds.indexOf(dragState.taskId);
+    const fromIdx = taskIds.indexOf(drag.taskId);
     const toIdx = taskIds.indexOf(overTaskId);
-    if (fromIdx === -1 || toIdx === -1) { setDragState(null); return; }
+    if (fromIdx === -1 || toIdx === -1) return;
     const reordered = [...section.tasks];
     const [moved] = reordered.splice(fromIdx, 1);
     reordered.splice(toIdx, 0, moved);
     const newStructure = structure.map((s, i) =>
       i === phaseIdx ? { ...s, tasks: reordered } : s
     );
-    setDragState(null);
     await applyStructureChange(newStructure);
   };
 
-  const handleDragEnd = () => setDragState(null);
+  const handleDragEnd = () => {
+    dragRef.current = null;
+    setDragOverId(null);
+  };
 
   // ─── BACKUP / IMPORT ─────────────────────────────────────────────────────────
   const handleManualBackup = () => {
@@ -796,8 +805,8 @@ export default function App() {
                   const isExpanded = expandedTasks[task.id] !== false;
                   const isGuideOpen = expandedGuides[task.id];
                   const secs = task.totalSeconds + task.sessionSeconds;
-                  const isDragging = dragState?.taskId === task.id;
-                  const isDragOver = dragState?.overTaskId === task.id;
+                  const isDragging = dragRef.current?.taskId === task.id;
+                  const isDragOver = dragOverId === task.id && dragRef.current?.taskId !== task.id;
 
                   return (
                     <div
@@ -805,7 +814,7 @@ export default function App() {
                       key={task.id}
                       className={`task-card${isDragging ? " dragging" : ""}${isDragOver && !isDragging ? " drag-over" : ""}`}
                       draggable={editMode}
-                      onDragStart={editMode ? (e) => handleDragStart(e, task.id) : undefined}
+                      onDragStart={editMode ? (e) => handleDragStart(e, task.id, section.phaseIdx) : undefined}
                       onDragOver={editMode ? (e) => handleDragOver(e, task.id) : undefined}
                       onDrop={editMode ? (e) => handleDrop(e, task.id, section.phaseIdx) : undefined}
                       onDragEnd={editMode ? handleDragEnd : undefined}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { supabase } from "./supabase.js";
 
 function formatDuration(totalSeconds) {
@@ -45,6 +45,7 @@ export default function App() {
   const freshTasks = useMemo(() => buildInitialTasks(), []);
   const [tasks, setTasks] = useState(freshTasks);
   const [search, setSearch] = useState("");
+  const [searchResultIndex, setSearchResultIndex] = useState(0);
   const [deadline, setDeadline] = useState("");
   const [activeTab, setActiveTab] = useState("all");
   const [expandedTasks, setExpandedTasks] = useState(() =>
@@ -202,7 +203,7 @@ export default function App() {
       ...s,
       items: s.items.filter((t) => {
         const q_lower = search.toLowerCase();
-        const q = t.title.toLowerCase().includes(q_lower) ||
+        const q = !search || t.title.toLowerCase().includes(q_lower) ||
           (t.description || "").toLowerCase().includes(q_lower) ||
           (t.practicalGuide || "").toLowerCase().includes(q_lower);
         if (activeTab === "suspended") return q && t.suspended;
@@ -215,7 +216,55 @@ export default function App() {
     [grouped, search, activeTab]
   );
 
-  const SyncDot = () => {
+  const searchResultIds = useMemo(() => {
+    if (!search) return [];
+    return filteredGrouped.flatMap(s => s.items.map(t => t.id));
+  }, [filteredGrouped, search]);
+
+  // Reset index when search changes
+  useEffect(() => { setSearchResultIndex(0); }, [search]);
+
+  const currentResultId = searchResultIds[searchResultIndex] ?? null;
+
+  // Scroll to current result
+  useEffect(() => {
+    if (!currentResultId) return;
+    const el = document.getElementById(`task-${currentResultId}`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [currentResultId]);
+
+  // Helper: highlight text
+  // Auto-expand task (and guide if match is in practicalGuide) when navigating
+  useEffect(() => {
+    if (!currentResultId || !search) return;
+    const task = tasks.find(t => t.id === currentResultId);
+    if (!task) return;
+    setExpandedTasks(p => ({ ...p, [currentResultId]: true }));
+    if (task.practicalGuide && task.practicalGuide.toLowerCase().includes(search.toLowerCase())) {
+      setExpandedGuides(p => ({ ...p, [currentResultId]: true }));
+    }
+  }, [currentResultId, search]);
+
+  const Highlight = useCallback(({ text }) => {
+    if (!search || !text) return <>{text}</>;
+    const q = search.toLowerCase();
+    const parts = [];
+    let last = 0;
+    let str = text;
+    let idx;
+    let strLower = str.toLowerCase();
+    while ((idx = strLower.indexOf(q, last)) !== -1) {
+      if (idx > last) parts.push(<span key={last}>{str.slice(last, idx)}</span>);
+      parts.push(
+        <mark key={idx} style={{ background: "#fbbf24", color: "#000", borderRadius: 3, padding: "0 2px" }}>
+          {str.slice(idx, idx + q.length)}
+        </mark>
+      );
+      last = idx + q.length;
+    }
+    if (last < str.length) parts.push(<span key={last}>{str.slice(last)}</span>);
+    return <>{parts}</>;
+  }, [search]);
     const map = { idle: ["#52525b", ""], syncing: ["#fbbf24", ""], ok: ["#34d399", "✓ Sincronizzato"], error: ["#ef4444", "⚠ Offline — dati salvati localmente"] };
     const [color, label] = map[syncStatus];
     return (
@@ -285,8 +334,32 @@ export default function App() {
 
           {/* Search + deadline */}
           <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="🔍  Cerca task..."
-              style={{ flex: 1, minWidth: 160, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, padding: "7px 12px", fontSize: 13, color: "#fff", outline: "none" }} />
+            <div style={{ flex: 1, minWidth: 160, position: "relative", display: "flex", alignItems: "center" }}>
+              <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="🔍  Cerca task, descrizione, guida..."
+                style={{ width: "100%", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, padding: "7px 12px", fontSize: 13, color: "#fff", outline: "none" }} />
+              {search && (
+                <button onClick={() => setSearch("")}
+                  style={{ position: "absolute", right: 8, background: "none", border: "none", color: "#52525b", cursor: "pointer", fontSize: 14, lineHeight: 1 }}>✕</button>
+              )}
+            </div>
+            {search && searchResultIds.length > 0 && (
+              <div style={{ display: "flex", alignItems: "center", gap: 4, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, padding: "4px 8px" }}>
+                <span style={{ fontSize: 11, color: "#a1a1aa", whiteSpace: "nowrap" }}>
+                  {searchResultIndex + 1}/{searchResultIds.length}
+                </span>
+                <button
+                  onClick={() => setSearchResultIndex(i => (i - 1 + searchResultIds.length) % searchResultIds.length)}
+                  style={{ background: "rgba(255,255,255,0.08)", border: "none", borderRadius: 6, color: "#e4e4e7", cursor: "pointer", width: 24, height: 24, fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center" }}>▲</button>
+                <button
+                  onClick={() => setSearchResultIndex(i => (i + 1) % searchResultIds.length)}
+                  style={{ background: "rgba(255,255,255,0.08)", border: "none", borderRadius: 6, color: "#e4e4e7", cursor: "pointer", width: 24, height: 24, fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center" }}>▼</button>
+              </div>
+            )}
+            {search && searchResultIds.length === 0 && (
+              <div style={{ display: "flex", alignItems: "center", padding: "4px 10px", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 10 }}>
+                <span style={{ fontSize: 11, color: "#f87171" }}>Nessun risultato</span>
+              </div>
+            )}
             <input type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)}
               style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, padding: "7px 10px", fontSize: 13, color: "#a1a1aa", outline: "none" }} />
           </div>
@@ -364,7 +437,7 @@ export default function App() {
 
                   return (
                     <div id={`task-${task.id}`} key={task.id} className="task-card"
-                      style={{ background: task.completed ? "rgba(52,211,153,0.04)" : task.suspended ? "rgba(251,146,60,0.06)" : "rgba(255,255,255,0.025)", border: `1px solid ${task.completed ? "rgba(52,211,153,0.15)" : task.suspended ? "rgba(251,146,60,0.2)" : "rgba(255,255,255,0.06)"}`, borderRadius: 14 }}>
+                      style={{ background: task.completed ? "rgba(52,211,153,0.04)" : task.suspended ? "rgba(251,146,60,0.06)" : "rgba(255,255,255,0.025)", border: `1px solid ${currentResultId === task.id ? "#fbbf24" : task.completed ? "rgba(52,211,153,0.15)" : task.suspended ? "rgba(251,146,60,0.2)" : "rgba(255,255,255,0.06)"}`, borderRadius: 14, boxShadow: currentResultId === task.id ? "0 0 0 2px rgba(251,191,36,0.25)" : "none" }}>
 
                       {/* Row */}
                       <div style={{ padding: "12px 14px", display: "flex", alignItems: "flex-start", gap: 10 }}>
@@ -375,7 +448,7 @@ export default function App() {
 
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                            <span style={{ fontSize: "0.85rem", fontWeight: 600, textDecoration: task.completed ? "line-through" : "none", color: task.completed ? "#3f3f46" : "#e4e4e7" }}>{task.title}</span>
+                            <span style={{ fontSize: "0.85rem", fontWeight: 600, textDecoration: task.completed ? "line-through" : "none", color: task.completed ? "#3f3f46" : "#e4e4e7" }}><Highlight text={task.title} /></span>
                             <span style={{ fontSize: 10, fontWeight: 600, padding: "2px 7px", borderRadius: 20, background: { "Da fare": "rgba(255,255,255,0.06)", "In corso": "rgba(96,165,250,0.15)", "In pausa": "rgba(251,191,36,0.15)", "Completato": "rgba(52,211,153,0.15)" }[task.status], color: { "Da fare": "#71717a", "In corso": "#93c5fd", "In pausa": "#fcd34d", "Completato": "#6ee7b7" }[task.status] }}>{task.status}</span>
                             {task.suspended && <span style={{ fontSize: 10, fontWeight: 600, background: "rgba(251,146,60,0.15)", color: "#fdba74", padding: "2px 7px", borderRadius: 20 }}>⏸ Sospesa</span>}
                             {task.timerRunning && <span className="timer-pulse" style={{ fontSize: 10, fontWeight: 600, background: "rgba(96,165,250,0.15)", color: "#93c5fd", padding: "2px 7px", borderRadius: 20 }}>⏱ {formatDuration(secs)}</span>}
@@ -395,7 +468,7 @@ export default function App() {
 
                           {/* Description */}
                           <div style={{ background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, padding: "12px 14px" }}>
-                            <p style={{ fontSize: 13, color: "#a1a1aa", lineHeight: 1.7, whiteSpace: "pre-line", margin: 0 }}>{task.description}</p>
+                            <p style={{ fontSize: 13, color: "#a1a1aa", lineHeight: 1.7, whiteSpace: "pre-line", margin: 0 }}><Highlight text={task.description} /></p>
                           </div>
 
                           {/* Practical guide */}
@@ -408,7 +481,7 @@ export default function App() {
                               </button>
                               {isGuideOpen && (
                                 <div style={{ borderTop: "1px solid rgba(255,255,255,0.05)", padding: "10px 14px" }}>
-                                  <p style={{ fontSize: 12, color: "#71717a", lineHeight: 1.7, whiteSpace: "pre-line", margin: 0 }}>{task.practicalGuide}</p>
+                                  <p style={{ fontSize: 12, color: "#71717a", lineHeight: 1.7, whiteSpace: "pre-line", margin: 0 }}><Highlight text={task.practicalGuide} /></p>
                                 </div>
                               )}
                             </div>

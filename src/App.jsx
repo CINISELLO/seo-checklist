@@ -265,6 +265,8 @@ export default function App() {
     if (last < str.length) parts.push(<span key={last}>{str.slice(last)}</span>);
     return <>{parts}</>;
   }, [search]);
+
+  const SyncDot = () => {
     const map = { idle: ["#52525b", ""], syncing: ["#fbbf24", ""], ok: ["#34d399", "✓ Sincronizzato"], error: ["#ef4444", "⚠ Offline — dati salvati localmente"] };
     const [color, label] = map[syncStatus];
     return (

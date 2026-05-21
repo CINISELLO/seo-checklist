@@ -106,6 +106,7 @@ export default function App() {
   // Drag state uses refs (no re-render) + a single visual indicator state
   const dragRef = useRef(null); // { taskId, phaseIdx }
   const [dragOverId, setDragOverId] = useState(null); // just for visual highlight
+  const pendingBackup = useRef(false); // true if structure was changed while in edit mode
   const [backupCount, setBackupCount] = useState(0);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importText, setImportText] = useState("");
@@ -313,9 +314,8 @@ export default function App() {
     setStructure(newStructure);
     setTasks(merged);
     await saveStructureToSupabase(newStructure);
-    // Auto-backup
-    triggerBackupDownload(merged, newStructure);
-    setBackupCount((c) => c + 1);
+    // Mark that a backup should be triggered when exiting edit mode
+    pendingBackup.current = true;
   };
 
   const handleSaveEditingTask = async () => {
@@ -624,7 +624,16 @@ export default function App() {
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               {/* Edit Mode Toggle */}
               <button
-                onClick={() => setEditMode((e) => !e)}
+                onClick={() => setEditMode((prev) => {
+                  const next = !prev;
+                  if (!next && pendingBackup.current) {
+                    // Exiting edit mode with unsaved changes → trigger backup now
+                    triggerBackupDownload(tasks, structure);
+                    setBackupCount((c) => c + 1);
+                    pendingBackup.current = false;
+                  }
+                  return next;
+                })}
                 title={editMode ? "Esci dalla modalità editing" : "Attiva modalità editing"}
                 style={{
                   padding: "7px 14px", borderRadius: 10, fontSize: 12, fontWeight: 700, cursor: "pointer",

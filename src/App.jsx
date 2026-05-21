@@ -58,10 +58,11 @@ function buildStructureFromTasks(tasks, phases) {
 }
 
 // ─── AUTO-BACKUP ───────────────────────────────────────────────────────────────
-function triggerBackupDownload(tasks, structure) {
+function triggerBackupDownload(tasks, structure, completionMeta = null) {
   const backup = {
     version: 2,
     exportedAt: new Date().toISOString(),
+    ...(completionMeta ? { completedAt: completionMeta.completedAt, completionNotes: completionMeta.notes, startDate: completionMeta.startDate, deadline: completionMeta.deadline, type: "completion" } : {}),
     structure: structure,
     taskState: tasks.map((t) => ({
       id: t.id,
@@ -76,7 +77,8 @@ function triggerBackupDownload(tasks, structure) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `seo-checklist-backup-${new Date().toISOString().slice(0, 16).replace("T", "_")}.json`;
+  const suffix = completionMeta ? "COMPLETATO" : new Date().toISOString().slice(0, 16).replace("T", "_");
+  a.download = `seo-checklist-backup-${suffix}.json`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -92,7 +94,10 @@ export default function App() {
 
   const [search, setSearch] = useState("");
   const [searchResultIndex, setSearchResultIndex] = useState(0);
+  const [startDate, setStartDate] = useState("");
   const [deadline, setDeadline] = useState("");
+  const [showCompletionModal, setShowCompletionModal] = useState(false);
+  const [completionNotes, setCompletionNotes] = useState("");
   const [activeTab, setActiveTab] = useState("all");
   const [expandedTasks, setExpandedTasks] = useState({});
   const [expandedGuides, setExpandedGuides] = useState({});
@@ -104,8 +109,6 @@ export default function App() {
   const [editingTask, setEditingTask] = useState(null); // { id, title, description, practicalGuide }
   const [editingPhase, setEditingPhase] = useState(null); // index being renamed
   // Drag state uses refs (no re-render) + a single visual indicator state
-  const dragRef = useRef(null); // { taskId, phaseIdx }
-  const [dragOverId, setDragOverId] = useState(null); // just for visual highlight
   const pendingBackup = useRef(false); // true if structure was changed while in edit mode
   const [backupCount, setBackupCount] = useState(0);
   const [showImportModal, setShowImportModal] = useState(false);
@@ -192,6 +195,8 @@ export default function App() {
 
       const dl = localStorage.getItem("seo-deadline-local");
       if (dl) setDeadline(dl);
+      const sd = localStorage.getItem("seo-startdate-local");
+      if (sd) setStartDate(sd);
       setSyncStatus(stateError ? "error" : "ok");
       setLoaded(true);
     }
@@ -206,10 +211,13 @@ export default function App() {
     return () => clearInterval(iv);
   }, []);
 
-  // ─── DEADLINE ────────────────────────────────────────────────────────────────
+  // ─── DEADLINE + START DATE ────────────────────────────────────────────────────
   useEffect(() => {
     localStorage.setItem("seo-deadline-local", deadline);
   }, [deadline]);
+  useEffect(() => {
+    localStorage.setItem("seo-startdate-local", startDate);
+  }, [startDate]);
 
   // ─── SAVE STATE ──────────────────────────────────────────────────────────────
   const saveTaskState = useCallback(async (taskId, updates, allTasks) => {
@@ -391,47 +399,6 @@ export default function App() {
     await applyStructureChange(newStructure);
   };
 
-  // ─── DRAG & DROP (ref-based, no re-render during drag) ───────────────────────
-  const handleDragStart = (e, taskId, phaseIdx) => {
-    dragRef.current = { taskId, phaseIdx };
-    e.dataTransfer.effectAllowed = "move";
-    // Store taskId in dataTransfer as fallback
-    e.dataTransfer.setData("text/plain", taskId);
-  };
-
-  const handleDragOver = (e, overTaskId) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    // Only update visual state if it changed (avoids unnecessary renders)
-    setDragOverId((prev) => prev === overTaskId ? prev : overTaskId);
-  };
-
-  const handleDrop = async (e, overTaskId, phaseIdx) => {
-    e.preventDefault();
-    setDragOverId(null);
-    const drag = dragRef.current;
-    dragRef.current = null;
-    if (!drag || drag.taskId === overTaskId) return;
-    // Only allow reorder within the same phase
-    if (drag.phaseIdx !== phaseIdx) return;
-    const section = structure[phaseIdx];
-    const taskIds = section.tasks.map((t) => t.id);
-    const fromIdx = taskIds.indexOf(drag.taskId);
-    const toIdx = taskIds.indexOf(overTaskId);
-    if (fromIdx === -1 || toIdx === -1) return;
-    const reordered = [...section.tasks];
-    const [moved] = reordered.splice(fromIdx, 1);
-    reordered.splice(toIdx, 0, moved);
-    const newStructure = structure.map((s, i) =>
-      i === phaseIdx ? { ...s, tasks: reordered } : s
-    );
-    await applyStructureChange(newStructure);
-  };
-
-  const handleDragEnd = () => {
-    dragRef.current = null;
-    setDragOverId(null);
-  };
 
   // ─── BACKUP / IMPORT ─────────────────────────────────────────────────────────
   const handleManualBackup = () => {
@@ -468,6 +435,33 @@ export default function App() {
     } catch (err) {
       setImportError("Errore nel parsing JSON: " + err.message);
     }
+  };
+
+  // ─── MOVE TASK UP/DOWN ────────────────────────────────────────────────────────
+  const handleMoveTask = async (phaseIdx, taskIdx, direction) => {
+    const section = structure[phaseIdx];
+    const newIdx = taskIdx + direction;
+    if (newIdx < 0 || newIdx >= section.tasks.length) return;
+    const reordered = [...section.tasks];
+    const [moved] = reordered.splice(taskIdx, 1);
+    reordered.splice(newIdx, 0, moved);
+    const newStructure = structure.map((s, i) =>
+      i === phaseIdx ? { ...s, tasks: reordered } : s
+    );
+    await applyStructureChange(newStructure);
+  };
+
+  // ─── PROJECT COMPLETION ───────────────────────────────────────────────────────
+  const handleProjectComplete = () => {
+    triggerBackupDownload(tasks, structure, {
+      completedAt: new Date().toISOString(),
+      notes: completionNotes,
+      startDate,
+      deadline,
+    });
+    setBackupCount((c) => c + 1);
+    setShowCompletionModal(false);
+    setCompletionNotes("");
   };
 
   // ─── DERIVED STATE ────────────────────────────────────────────────────────────
@@ -584,8 +578,6 @@ export default function App() {
         * { box-sizing: border-box; }
         .task-card { transition: transform 0.15s ease, box-shadow 0.15s ease; }
         .task-card:hover { transform: translateY(-1px); }
-        .task-card.drag-over { border-color: #a78bfa !important; box-shadow: 0 0 0 2px rgba(167,139,250,0.3) !important; }
-        .task-card.dragging { opacity: 0.4; }
         .timer-pulse { animation: tpulse 2s infinite; }
         @keyframes tpulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
         .pbar { transition: width 0.5s cubic-bezier(0.4,0,0.2,1); }
@@ -598,8 +590,9 @@ export default function App() {
         .edit-input:focus { border-color: rgba(167,139,250,0.7); }
         .edit-textarea { background: rgba(167,139,250,0.08); border: 1px solid rgba(167,139,250,0.3); border-radius: 8px; padding: 9px 12px; font-size: 12px; color: #a1a1aa; outline: none; width: 100%; resize: vertical; line-height: 1.7; transition: border-color 0.15s; }
         .edit-textarea:focus { border-color: rgba(167,139,250,0.7); }
-        .drag-handle { cursor: grab; color: #3f3f46; font-size: 14px; padding: 0 4px; user-select: none; }
-        .drag-handle:hover { color: #a78bfa; }
+        .move-btn { background: rgba(167,139,250,0.08); border: 1px solid rgba(167,139,250,0.2); border-radius: 6px; color: #71717a; cursor: pointer; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 13px; transition: all 0.15s; padding: 0; }
+        .move-btn:hover:not(:disabled) { background: rgba(167,139,250,0.2); color: #c4b5fd; }
+        .move-btn:disabled { opacity: 0.2; cursor: default; }
         .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 200; display: flex; align-items: center; justify-content: center; padding: 16px; backdrop-filter: blur(4px); }
         .modal-box { background: #12121f; border: 1px solid rgba(167,139,250,0.2); border-radius: 20px; padding: 24px; width: 100%; max-width: 600px; max-height: 90vh; overflow-y: auto; }
         .btn-edit { padding: 5px 10px; border-radius: 7px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s; border: 1px solid rgba(167,139,250,0.3); background: rgba(167,139,250,0.1); color: #c4b5fd; }
@@ -683,6 +676,16 @@ export default function App() {
                 <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.1rem", fontWeight: 700 }}>{formatDuration(totalTime)}</div>
                 <div style={{ fontSize: 10, color: "#52525b" }}>tempo totale</div>
               </div>
+              <button
+                onClick={() => setShowCompletionModal(true)}
+                title="Segna progetto come completato e scarica backup finale"
+                style={{
+                  padding: "7px 14px", borderRadius: 10, fontSize: 12, fontWeight: 700, cursor: "pointer",
+                  background: "rgba(52,211,153,0.15)", border: "1px solid rgba(52,211,153,0.35)", color: "#6ee7b7",
+                  display: "flex", alignItems: "center", gap: 6, transition: "all 0.2s",
+                }}>
+                🏁 Completa
+              </button>
             </div>
           </div>
 
@@ -691,7 +694,7 @@ export default function App() {
             <div className="edit-badge" style={{ marginTop: 8, padding: "8px 14px", borderRadius: 10, background: "rgba(167,139,250,0.08)", border: "1px solid rgba(167,139,250,0.25)", fontSize: 12, color: "#c4b5fd", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <span style={{ fontWeight: 700 }}>🔧 Modalità Editing attiva</span>
               <span style={{ color: "#71717a" }}>·</span>
-              <span style={{ color: "#71717a" }}>✏️ modifica titoli e contenuti &nbsp;·&nbsp; ➕ aggiungi task &nbsp;·&nbsp; 🗑️ elimina &nbsp;·&nbsp; ↕️ trascina per riordinare</span>
+              <span style={{ color: "#71717a" }}>✏️ modifica titoli e contenuti &nbsp;·&nbsp; ➕ aggiungi task &nbsp;·&nbsp; 🗑️ elimina &nbsp;·&nbsp; ↕️ riordina con le frecce</span>
               <span style={{ color: "#71717a" }}>·</span>
               <span style={{ color: "#6ee7b7", fontWeight: 600 }}>💾 ogni modifica salva su Supabase + backup locale automatico</span>
             </div>
@@ -723,8 +726,16 @@ export default function App() {
                 <span style={{ fontSize: 11, color: "#f87171" }}>Nessun risultato</span>
               </div>
             )}
-            <input type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)}
-              style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, padding: "7px 10px", fontSize: 13, color: "#a1a1aa", outline: "none" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, padding: "4px 10px" }}>
+              <span style={{ fontSize: 10, color: "#52525b", whiteSpace: "nowrap" }}>Inizio</span>
+              <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)}
+                style={{ background: "none", border: "none", fontSize: 12, color: "#a1a1aa", outline: "none", cursor: "pointer" }} />
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, padding: "4px 10px" }}>
+              <span style={{ fontSize: 10, color: "#52525b", whiteSpace: "nowrap" }}>Scadenza</span>
+              <input type="date" value={deadline} onChange={(e) => setDeadline(e.target.value)}
+                style={{ background: "none", border: "none", fontSize: 12, color: "#a1a1aa", outline: "none", cursor: "pointer" }} />
+            </div>
           </div>
 
           {/* Tabs */}
@@ -814,19 +825,14 @@ export default function App() {
                   const isExpanded = expandedTasks[task.id] !== false;
                   const isGuideOpen = expandedGuides[task.id];
                   const secs = task.totalSeconds + task.sessionSeconds;
-                  const isDragging = dragRef.current?.taskId === task.id;
-                  const isDragOver = dragOverId === task.id && dragRef.current?.taskId !== task.id;
+                  const taskIdx = section.items.indexOf(task);
+                  const totalInPhase = section.items.length;
 
                   return (
                     <div
                       id={`task-${task.id}`}
                       key={task.id}
-                      className={`task-card${isDragging ? " dragging" : ""}${isDragOver && !isDragging ? " drag-over" : ""}`}
-                      draggable={editMode}
-                      onDragStart={editMode ? (e) => handleDragStart(e, task.id, section.phaseIdx) : undefined}
-                      onDragOver={editMode ? (e) => handleDragOver(e, task.id) : undefined}
-                      onDrop={editMode ? (e) => handleDrop(e, task.id, section.phaseIdx) : undefined}
-                      onDragEnd={editMode ? handleDragEnd : undefined}
+                      className="task-card"
                       style={{
                         background: task.completed ? "rgba(52,211,153,0.04)" : task.suspended ? "rgba(251,146,60,0.06)" : "rgba(255,255,255,0.025)",
                         border: `1px solid ${currentResultId === task.id ? "#fbbf24" : task.completed ? "rgba(52,211,153,0.15)" : task.suspended ? "rgba(251,146,60,0.2)" : editMode ? "rgba(167,139,250,0.15)" : "rgba(255,255,255,0.06)"}`,
@@ -838,7 +844,18 @@ export default function App() {
                       <div style={{ padding: "12px 14px", display: "flex", alignItems: "flex-start", gap: 10 }}>
                         {/* Drag handle in edit mode */}
                         {editMode && (
-                          <span className="drag-handle" title="Trascina per riordinare">⠿</span>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                            <button
+                              className="move-btn"
+                              disabled={taskIdx === 0}
+                              onClick={() => handleMoveTask(section.phaseIdx, taskIdx, -1)}
+                              title="Sposta su">▲</button>
+                            <button
+                              className="move-btn"
+                              disabled={taskIdx === totalInPhase - 1}
+                              onClick={() => handleMoveTask(section.phaseIdx, taskIdx, 1)}
+                              title="Sposta giù">▼</button>
+                          </div>
                         )}
 
                         {/* Checkbox */}
@@ -1016,6 +1033,87 @@ export default function App() {
               <div style={{ fontSize: 11, color: "#52525b", textAlign: "center", marginTop: 4 }}>
                 Il salvataggio aggiornerà Supabase e scaricherà automaticamente un backup JSON
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── COMPLETION MODAL ── */}
+      {showCompletionModal && (
+        <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && setShowCompletionModal(false)}>
+          <div className="modal-box">
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+              <h3 style={{ fontFamily: "Syne, sans-serif", fontWeight: 700, margin: 0, fontSize: "1.1rem" }}>🏁 Progetto Completato</h3>
+              <button onClick={() => setShowCompletionModal(false)} style={{ background: "none", border: "none", color: "#71717a", fontSize: 18, cursor: "pointer", lineHeight: 1 }}>✕</button>
+            </div>
+
+            {/* Summary */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 18 }}>
+              <div style={{ background: "rgba(52,211,153,0.08)", border: "1px solid rgba(52,211,153,0.2)", borderRadius: 10, padding: "10px 12px", textAlign: "center" }}>
+                <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.4rem", fontWeight: 800, color: "#34d399" }}>{completedCount}/{total}</div>
+                <div style={{ fontSize: 10, color: "#52525b", marginTop: 2 }}>task completati</div>
+              </div>
+              <div style={{ background: "rgba(96,165,250,0.08)", border: "1px solid rgba(96,165,250,0.2)", borderRadius: 10, padding: "10px 12px", textAlign: "center" }}>
+                <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.4rem", fontWeight: 800, color: "#60a5fa" }}>{formatDuration(totalTime)}</div>
+                <div style={{ fontSize: 10, color: "#52525b", marginTop: 2 }}>tempo totale</div>
+              </div>
+              <div style={{ background: "rgba(167,139,250,0.08)", border: "1px solid rgba(167,139,250,0.2)", borderRadius: 10, padding: "10px 12px", textAlign: "center" }}>
+                <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.4rem", fontWeight: 800, color: "#a78bfa" }}>
+                  {startDate && deadline
+                    ? `${Math.ceil((new Date(deadline) - new Date(startDate)) / 86400000)}g`
+                    : startDate
+                    ? `${Math.ceil((new Date() - new Date(startDate)) / 86400000)}g`
+                    : "—"}
+                </div>
+                <div style={{ fontSize: 10, color: "#52525b", marginTop: 2 }}>durata progetto</div>
+              </div>
+            </div>
+
+            {/* Dates recap */}
+            {(startDate || deadline) && (
+              <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+                {startDate && (
+                  <div style={{ fontSize: 12, color: "#71717a", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "4px 10px" }}>
+                    🗓 Inizio: <strong style={{ color: "#d4d4d8" }}>{new Date(startDate).toLocaleDateString("it-IT")}</strong>
+                  </div>
+                )}
+                {deadline && (
+                  <div style={{ fontSize: 12, color: "#71717a", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "4px 10px" }}>
+                    🏁 Scadenza: <strong style={{ color: "#d4d4d8" }}>{new Date(deadline).toLocaleDateString("it-IT")}</strong>
+                  </div>
+                )}
+                <div style={{ fontSize: 12, color: "#71717a", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "4px 10px" }}>
+                  ✅ Completato: <strong style={{ color: "#d4d4d8" }}>{new Date().toLocaleDateString("it-IT")}</strong>
+                </div>
+              </div>
+            )}
+
+            {/* Notes */}
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ fontSize: 11, color: "#71717a", marginBottom: 6, fontWeight: 600 }}>NOTE FINALI (opzionali)</div>
+              <textarea
+                className="edit-textarea"
+                value={completionNotes}
+                onChange={(e) => setCompletionNotes(e.target.value)}
+                placeholder="Es: risultati ottenuti, problemi riscontrati, note per il cliente..."
+                style={{ minHeight: 110 }}
+                autoFocus
+              />
+            </div>
+
+            <p style={{ fontSize: 12, color: "#52525b", marginBottom: 14, marginTop: 0 }}>
+              Verrà scaricato automaticamente un backup JSON contrassegnato come <strong style={{ color: "#6ee7b7" }}>COMPLETATO</strong>, con data, durata e note incluse.
+            </p>
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowCompletionModal(false)}
+                style={{ padding: "8px 18px", borderRadius: 9, fontSize: 13, fontWeight: 600, cursor: "pointer", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#71717a" }}>
+                Annulla
+              </button>
+              <button onClick={handleProjectComplete}
+                style={{ padding: "8px 20px", borderRadius: 9, fontSize: 13, fontWeight: 700, cursor: "pointer", background: "rgba(52,211,153,0.2)", border: "1px solid rgba(52,211,153,0.4)", color: "#6ee7b7" }}>
+                🏁 Conferma e scarica backup
+              </button>
             </div>
           </div>
         </div>

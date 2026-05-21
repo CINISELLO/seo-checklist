@@ -111,6 +111,7 @@ function ProjectApp({ client, onBack }) {
   // Drag state uses refs (no re-render) + a single visual indicator state
   const structureOnEditStart = useRef(null); // snapshot of structure when edit mode was activated
   const [backupCount, setBackupCount] = useState(0);
+  const [lastAutoBackup, setLastAutoBackup] = useState(null);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importText, setImportText] = useState("");
   const [importError, setImportError] = useState("");
@@ -211,6 +212,20 @@ function ProjectApp({ client, onBack }) {
     return () => clearInterval(iv);
   }, []);
 
+  // ─── AUTO-BACKUP OGNI 20 MINUTI ───────────────────────────────────────────────
+  const tasksRef = useRef(tasks);
+  const structureRef = useRef(structure);
+  useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+  useEffect(() => { structureRef.current = structure; }, [structure]);
+  useEffect(() => {
+    const iv = setInterval(() => {
+      triggerBackupDownload(tasksRef.current, structureRef.current);
+      setBackupCount((c) => c + 1);
+      setLastAutoBackup(new Date());
+    }, 20 * 60 * 1000);
+    return () => clearInterval(iv);
+  }, []);
+
   // ─── DEADLINE + START DATE ────────────────────────────────────────────────────
   useEffect(() => {
     localStorage.setItem(`seo-deadline-local-${client.id}`, deadline);
@@ -307,7 +322,14 @@ function ProjectApp({ client, onBack }) {
     });
   };
 
-  const startTimer = (id) => updateAndSave(id, { timerRunning: true, status: "In corso" });
+  const startTimer = (id) => {
+    // Track when a task first goes "In corso" for stale detection
+    const key = `seo-task-started-${client.id}-${id}`;
+    if (!localStorage.getItem(key)) {
+      localStorage.setItem(key, new Date().toISOString());
+    }
+    updateAndSave(id, { timerRunning: true, status: "In corso" });
+  };
   const pauseTimer = (id) => {
     setTasks((prev) => {
       const t = prev.find((x) => x.id === id);
@@ -716,7 +738,7 @@ function ProjectApp({ client, onBack }) {
                   display: "flex", alignItems: "center", gap: 5,
                 }}>
                 💾 Backup
-                {backupCount > 0 && <span style={{ fontSize: 10, background: "rgba(96,165,250,0.2)", borderRadius: 20, padding: "1px 6px" }}>{backupCount}</span>}
+                {lastAutoBackup && <span style={{ fontSize: 10, background: "rgba(96,165,250,0.2)", borderRadius: 20, padding: "1px 6px" }} title={`Ultimo backup auto: ${lastAutoBackup.toLocaleTimeString("it-IT")}`}>✓ {lastAutoBackup.toLocaleTimeString("it-IT", {hour:"2-digit",minute:"2-digit"})}</span>}
               </button>
 
               {/* Import */}
@@ -1011,7 +1033,13 @@ function ProjectApp({ client, onBack }) {
                           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                             <div>
                               <div style={{ fontSize: 10, color: "#52525b", marginBottom: 4 }}>Stato</div>
-                              <select value={task.status} onChange={(e) => updateAndSave(task.id, { status: e.target.value })}
+                              <select value={task.status} onChange={(e) => {
+                if (e.target.value === "In corso") {
+                  const key = `seo-task-started-${client.id}-${task.id}`;
+                  if (!localStorage.getItem(key)) localStorage.setItem(key, new Date().toISOString());
+                }
+                updateAndSave(task.id, { status: e.target.value });
+              }}
                                 style={{ width: "100%", background: "rgba(0,0,0,0.4)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "7px 10px", fontSize: 12, color: "#d4d4d8", outline: "none" }}>
                                 {["Da fare", "In corso", "In pausa", "Completato"].map((s) => <option key={s}>{s}</option>)}
                               </select>
@@ -1260,6 +1288,7 @@ function ClientList({ onSelect }) {
   const [newName, setNewName] = useState("");
   const [editingId, setEditingId] = useState(null);
   const [editingName, setEditingName] = useState("");
+  const [newDeadlines, setNewDeadlines] = useState({});
 
   const saveClients = (list) => {
     setClients(list);
@@ -1269,7 +1298,7 @@ function ClientList({ onSelect }) {
   const addClient = () => {
     const name = newName.trim();
     if (!name) return;
-    const client = { id: `client-${Date.now()}`, name, createdAt: new Date().toISOString(), publishedDate: null };
+    const client = { id: `client-${Date.now()}`, name, createdAt: new Date().toISOString(), publishedDate: null, deadline: null };
     saveClients([...clients, client]);
     setNewName("");
   };
@@ -1283,11 +1312,13 @@ function ClientList({ onSelect }) {
     saveClients(clients.map((c) => c.id === id ? { ...c, publishedDate: date } : c));
   };
 
-  const startEdit = (client) => {
-    setEditingId(client.id);
-    setEditingName(client.name);
+  const setClientDeadline = (id, date) => {
+    saveClients(clients.map((c) => c.id === id ? { ...c, deadline: date } : c));
+    // Also sync to the per-client localStorage deadline key
+    localStorage.setItem(`seo-deadline-local-${id}`, date);
   };
 
+  const startEdit = (client) => { setEditingId(client.id); setEditingName(client.name); };
   const saveEdit = (id) => {
     const name = editingName.trim();
     if (!name) return;
@@ -1295,13 +1326,45 @@ function ClientList({ onSelect }) {
     setEditingId(null);
   };
 
-  // Analytics reminder: show badge if publishedDate is set and >= 30 days ago
+  // ── Read per-client stats from localStorage ──
+  const getClientStats = (client) => {
+    try {
+      const state = JSON.parse(localStorage.getItem(`seo-checklist-local-${client.id}`)) || [];
+      const struct = JSON.parse(localStorage.getItem(`seo-checklist-structure-${client.id}`));
+      const totalTasks = struct ? struct.reduce((a, s) => a + s.tasks.length, 0) : state.length;
+      const completed = state.filter((t) => t.completed).length;
+      const inProgress = state.filter((t) => t.status === "In corso").length;
+      const suspended = state.filter((t) => t.suspended).length;
+      const totalSeconds = state.reduce((a, t) => a + (t.totalSeconds || 0), 0);
+      // Tasks "in corso" da troppo tempo: status In corso ma non completato
+      // We track this via a separate key per task: seo-task-started-{clientId}-{taskId}
+      const staleTasks = state.filter((t) => {
+        if (t.status !== "In corso" || t.completed) return false;
+        const startedKey = localStorage.getItem(`seo-task-started-${client.id}-${t.id}`);
+        if (!startedKey) return false;
+        const daysSince = Math.floor((new Date() - new Date(startedKey)) / 86400000);
+        return daysSince >= 3;
+      });
+      return { totalTasks, completed, inProgress, suspended, totalSeconds, staleTasks, hasData: state.length > 0 };
+    } catch { return { totalTasks: 0, completed: 0, inProgress: 0, suspended: 0, totalSeconds: 0, staleTasks: [], hasData: false }; }
+  };
+
+  // ── Deadline helpers ──
+  const getDeadline = (client) => {
+    // Prefer client-level deadline, fallback to localStorage per-client
+    if (client.deadline) return client.deadline;
+    return localStorage.getItem(`seo-deadline-local-${client.id}`) || null;
+  };
+
+  const daysToDeadline = (client) => {
+    const dl = getDeadline(client);
+    if (!dl) return null;
+    return Math.ceil((new Date(dl) - new Date()) / 86400000);
+  };
+
   const needsAnalytics = (client) => {
     if (!client.publishedDate) return false;
-    const pub = new Date(client.publishedDate);
-    const now = new Date();
-    const daysSince = Math.floor((now - pub) / 86400000);
-    return daysSince >= 30;
+    return Math.floor((new Date() - new Date(client.publishedDate)) / 86400000) >= 30;
   };
 
   const daysSincePublish = (client) => {
@@ -1309,39 +1372,64 @@ function ClientList({ onSelect }) {
     return Math.floor((new Date() - new Date(client.publishedDate)) / 86400000);
   };
 
+  // ── Compute alerts ──
+  const getAlerts = (client) => {
+    const alerts = [];
+    const dtd = daysToDeadline(client);
+    const stats = getClientStats(client);
+    if (dtd !== null && dtd < 0) alerts.push({ type: "danger", msg: `Scadenza superata di ${Math.abs(dtd)} giorni` });
+    else if (dtd !== null && dtd <= 5) alerts.push({ type: "warning", msg: `Scadenza tra ${dtd} giorni` });
+    if (stats.staleTasks.length > 0) alerts.push({ type: "warning", msg: `${stats.staleTasks.length} task in corso da 3+ giorni` });
+    if (needsAnalytics(client)) alerts.push({ type: "analytics", msg: `Analytics mensile — ${daysSincePublish(client)}g dalla pubblicazione` });
+    return alerts;
+  };
+
+  const alertColor = { danger: "#ef4444", warning: "#fbbf24", analytics: "#fb923c" };
+  const alertBg = { danger: "rgba(239,68,68,0.12)", warning: "rgba(251,191,36,0.12)", analytics: "rgba(251,146,60,0.12)" };
+
+  // Global alerts banner
+  const allAlerts = clients.flatMap((c) => getAlerts(c).map((a) => ({ ...a, clientName: c.name })));
+
   return (
     <div style={{ minHeight: "100vh", background: "#0a0a0f", color: "#fff", fontFamily: "'DM Sans', sans-serif" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500;600&display=swap');
         * { box-sizing: border-box; }
-        .client-card { transition: transform 0.15s ease, border-color 0.15s ease; cursor: pointer; }
-        .client-card:hover { transform: translateY(-2px); }
-        .edit-input-cl { background: rgba(167,139,250,0.08); border: 1px solid rgba(167,139,250,0.3); border-radius: 8px; padding: 7px 10px; font-size: 14px; color: #e4e4e7; outline: none; font-family: inherit; }
+        .client-card { transition: transform 0.15s ease, box-shadow 0.15s ease; }
+        .client-card:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+        .edit-input-cl { background: rgba(167,139,250,0.08); border: 1px solid rgba(167,139,250,0.3); border-radius: 8px; padding: 7px 10px; font-size: 14px; color: #e4e4e7; outline: none; font-family: inherit; width: 100%; }
         .edit-input-cl:focus { border-color: rgba(167,139,250,0.7); }
+        .stat-box { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07); border-radius: 10px; padding: 8px 12px; text-align: center; flex: 1; min-width: 60px; }
+        input[type=date]::-webkit-calendar-picker-indicator { filter: invert(1) opacity(0.4); }
       `}</style>
 
-      <div style={{ maxWidth: 700, margin: "0 auto", padding: "40px 16px" }}>
+      <div style={{ maxWidth: 780, margin: "0 auto", padding: "32px 16px 60px" }}>
+
         {/* Header */}
-        <div style={{ marginBottom: 36, textAlign: "center" }}>
-          <h1 style={{ fontFamily: "Syne, sans-serif", fontSize: "clamp(1.8rem,6vw,2.6rem)", fontWeight: 800, letterSpacing: "-0.04em", margin: 0, background: "linear-gradient(135deg,#a78bfa,#60a5fa)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+        <div style={{ marginBottom: 28, textAlign: "center" }}>
+          <h1 style={{ fontFamily: "Syne, sans-serif", fontSize: "clamp(1.8rem,6vw,2.4rem)", fontWeight: 800, letterSpacing: "-0.04em", margin: 0, background: "linear-gradient(135deg,#a78bfa,#60a5fa)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
             I tuoi clienti
           </h1>
-          <p style={{ color: "#52525b", fontSize: 14, marginTop: 6 }}>Seleziona un cliente per aprire la sua SEO checklist</p>
+          <p style={{ color: "#52525b", fontSize: 13, marginTop: 4 }}>
+            {clients.length > 0 ? `${clients.length} progetti · seleziona per aprire la checklist` : "Seleziona un cliente per aprire la sua SEO checklist"}
+          </p>
         </div>
 
-        {/* Analytics reminders banner */}
-        {clients.some(needsAnalytics) && (
-          <div style={{ marginBottom: 20, background: "rgba(251,146,60,0.08)", border: "1px solid rgba(251,146,60,0.25)", borderRadius: 14, padding: "12px 16px" }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: "#fb923c", marginBottom: 6 }}>📊 Promemoria Analytics mensile</div>
-            {clients.filter(needsAnalytics).map((c) => (
-              <div key={c.id} style={{ fontSize: 12, color: "#fdba74", marginBottom: 2 }}>
-                • <strong>{c.name}</strong> — pubblicato {daysSincePublish(c)} giorni fa, rendiconto analytics in scadenza
+        {/* ── GLOBAL ALERTS BANNER ── */}
+        {allAlerts.length > 0 && (
+          <div style={{ marginBottom: 20, background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 14, padding: "12px 16px", display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#f87171", marginBottom: 2 }}>⚠️ Attenzione richiesta</div>
+            {allAlerts.map((a, i) => (
+              <div key={i} style={{ fontSize: 12, color: alertColor[a.type], display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ background: alertBg[a.type], borderRadius: 6, padding: "1px 7px", fontWeight: 600 }}>{a.clientName}</span>
+                <span style={{ color: "#71717a" }}>—</span>
+                <span>{a.msg}</span>
               </div>
             ))}
           </div>
         )}
 
-        {/* Client cards */}
+        {/* ── CLIENT CARDS ── */}
         {clients.length === 0 && (
           <div style={{ textAlign: "center", padding: "40px 0", color: "#3f3f46" }}>
             <div style={{ fontSize: 40, marginBottom: 8 }}>👤</div>
@@ -1349,72 +1437,117 @@ function ClientList({ onSelect }) {
           </div>
         )}
 
-        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 20 }}>
           {clients.map((client) => {
-            const analytics = needsAnalytics(client);
-            const days = daysSincePublish(client);
+            const stats = getClientStats(client);
+            const alerts = getAlerts(client);
+            const dtd = daysToDeadline(client);
+            const dl = getDeadline(client);
+            const pct = stats.totalTasks > 0 ? Math.round((stats.completed / stats.totalTasks) * 100) : 0;
+            const hasDanger = alerts.some((a) => a.type === "danger");
+            const hasWarning = alerts.some((a) => a.type === "warning");
+            const borderColor = hasDanger ? "rgba(239,68,68,0.4)" : hasWarning ? "rgba(251,191,36,0.35)" : "rgba(255,255,255,0.08)";
+            const h = Math.floor(stats.totalSeconds / 3600);
+            const m = Math.floor((stats.totalSeconds % 3600) / 60);
+            const timeStr = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m` : "—";
+
             return (
-              <div
-                key={client.id}
-                className="client-card"
-                style={{
-                  background: "rgba(255,255,255,0.025)",
-                  border: `1px solid ${analytics ? "rgba(251,146,60,0.35)" : "rgba(255,255,255,0.08)"}`,
-                  borderRadius: 16,
-                  padding: "14px 16px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 12,
-                  flexWrap: "wrap",
-                }}>
-                {/* Name / edit */}
-                <div style={{ flex: 1, minWidth: 0 }} onClick={() => !editingId && onSelect(client)}>
-                  {editingId === client.id ? (
-                    <div style={{ display: "flex", gap: 6, alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
-                      <input
-                        className="edit-input-cl"
-                        value={editingName}
-                        onChange={(e) => setEditingName(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter") saveEdit(client.id); if (e.key === "Escape") setEditingId(null); }}
-                        autoFocus
-                        style={{ flex: 1 }}
-                      />
-                      <button onClick={() => saveEdit(client.id)} style={{ padding: "5px 10px", borderRadius: 7, fontSize: 11, fontWeight: 700, cursor: "pointer", background: "rgba(52,211,153,0.15)", border: "1px solid rgba(52,211,153,0.3)", color: "#6ee7b7" }}>✓</button>
-                      <button onClick={() => setEditingId(null)} style={{ padding: "5px 10px", borderRadius: 7, fontSize: 11, fontWeight: 700, cursor: "pointer", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#71717a" }}>✕</button>
-                    </div>
-                  ) : (
-                    <div>
-                      <div style={{ fontFamily: "Syne, sans-serif", fontWeight: 700, fontSize: "1rem", color: "#e4e4e7", display: "flex", alignItems: "center", gap: 8 }}>
-                        {client.name}
-                        {analytics && <span style={{ fontSize: 10, background: "rgba(251,146,60,0.2)", border: "1px solid rgba(251,146,60,0.35)", borderRadius: 20, padding: "2px 7px", color: "#fb923c", fontFamily: "inherit", fontWeight: 600 }}>📊 Analytics</span>}
+              <div key={client.id} className="client-card"
+                style={{ background: "rgba(255,255,255,0.025)", border: `1px solid ${borderColor}`, borderRadius: 18, overflow: "hidden" }}>
+
+                {/* Top row: name + actions */}
+                <div style={{ padding: "14px 16px 10px", display: "flex", alignItems: "flex-start", gap: 10 }}>
+                  <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => !editingId && onSelect(client)}>
+                    {editingId === client.id ? (
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
+                        <input className="edit-input-cl" value={editingName}
+                          onChange={(e) => setEditingName(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") saveEdit(client.id); if (e.key === "Escape") setEditingId(null); }}
+                          autoFocus style={{ flex: 1, width: "auto" }} />
+                        <button onClick={() => saveEdit(client.id)} style={{ padding: "5px 10px", borderRadius: 7, fontSize: 11, fontWeight: 700, cursor: "pointer", background: "rgba(52,211,153,0.15)", border: "1px solid rgba(52,211,153,0.3)", color: "#6ee7b7", whiteSpace: "nowrap" }}>✓</button>
+                        <button onClick={() => setEditingId(null)} style={{ padding: "5px 10px", borderRadius: 7, fontSize: 11, fontWeight: 700, cursor: "pointer", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#71717a" }}>✕</button>
                       </div>
-                      <div style={{ fontSize: 11, color: "#52525b", marginTop: 2 }}>
-                        Creato il {new Date(client.createdAt).toLocaleDateString("it-IT")}
-                        {client.publishedDate && ` · Pubblicato il ${new Date(client.publishedDate).toLocaleDateString("it-IT")}${days !== null ? ` (${days}g fa)` : ""}`}
+                    ) : (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                        <span style={{ fontFamily: "Syne, sans-serif", fontWeight: 700, fontSize: "1rem", color: "#e4e4e7" }}>{client.name}</span>
+                        {alerts.map((a, i) => (
+                          <span key={i} style={{ fontSize: 10, background: alertBg[a.type], border: `1px solid ${alertColor[a.type]}44`, borderRadius: 20, padding: "2px 7px", color: alertColor[a.type], fontWeight: 600, whiteSpace: "nowrap" }}>
+                            {a.type === "danger" ? "🔴" : a.type === "analytics" ? "📊" : "⚠️"} {a.type === "analytics" ? "Analytics" : a.type === "danger" ? "Scaduto" : "Ritardo"}
+                          </span>
+                        ))}
                       </div>
+                    )}
+                    {editingId !== client.id && (
+                      <div style={{ fontSize: 11, color: "#52525b", marginTop: 3 }}>
+                        Creato {new Date(client.createdAt).toLocaleDateString("it-IT")}
+                        {client.publishedDate && ` · Pubblicato ${new Date(client.publishedDate).toLocaleDateString("it-IT")}`}
+                      </div>
+                    )}
+                  </div>
+                  {editingId !== client.id && (
+                    <div style={{ display: "flex", gap: 5, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
+                      <button onClick={() => startEdit(client)} style={{ padding: "5px 8px", borderRadius: 7, fontSize: 11, cursor: "pointer", background: "rgba(167,139,250,0.1)", border: "1px solid rgba(167,139,250,0.2)", color: "#c4b5fd" }}>✏️</button>
+                      <button onClick={() => deleteClient(client.id)} style={{ padding: "5px 8px", borderRadius: 7, fontSize: 11, cursor: "pointer", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", color: "#fca5a5" }}>🗑️</button>
+                      <button onClick={() => onSelect(client)} style={{ padding: "5px 12px", borderRadius: 7, fontSize: 12, fontWeight: 700, cursor: "pointer", background: "rgba(167,139,250,0.15)", border: "1px solid rgba(167,139,250,0.3)", color: "#c4b5fd" }}>Apri →</button>
                     </div>
                   )}
                 </div>
 
-                {/* Published date setter */}
-                {!editingId && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
-                    <span style={{ fontSize: 10, color: "#52525b", whiteSpace: "nowrap" }}>🌐 Pubblicato</span>
-                    <input
-                      type="date"
-                      value={client.publishedDate || ""}
-                      onChange={(e) => setPublishedDate(client.id, e.target.value)}
-                      style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 7, padding: "4px 8px", fontSize: 11, color: "#a1a1aa", outline: "none", cursor: "pointer" }}
-                    />
-                  </div>
-                )}
+                {/* Progress bar */}
+                <div style={{ margin: "0 16px 10px", height: 4, borderRadius: 2, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+                  <div style={{ height: "100%", borderRadius: 2, width: `${pct}%`, background: pct === 100 ? "#34d399" : "linear-gradient(90deg,#6366f1,#a78bfa)", transition: "width 0.5s" }} />
+                </div>
 
-                {/* Actions */}
-                {!editingId && (
-                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
-                    <button onClick={() => startEdit(client)} style={{ padding: "5px 10px", borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: "pointer", background: "rgba(167,139,250,0.1)", border: "1px solid rgba(167,139,250,0.2)", color: "#c4b5fd" }}>✏️</button>
-                    <button onClick={() => deleteClient(client.id)} style={{ padding: "5px 10px", borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: "pointer", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", color: "#fca5a5" }}>🗑️</button>
-                    <button onClick={() => onSelect(client)} style={{ padding: "5px 14px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer", background: "rgba(167,139,250,0.15)", border: "1px solid rgba(167,139,250,0.3)", color: "#c4b5fd" }}>Apri →</button>
+                {/* Stats row */}
+                <div style={{ padding: "0 16px 12px", display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  <div className="stat-box">
+                    <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.1rem", fontWeight: 700, color: pct === 100 ? "#34d399" : "#e4e4e7" }}>{pct}%</div>
+                    <div style={{ fontSize: 9, color: "#52525b", marginTop: 1 }}>{stats.completed}/{stats.totalTasks} task</div>
+                  </div>
+                  <div className="stat-box">
+                    <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.1rem", fontWeight: 700, color: "#60a5fa" }}>{timeStr}</div>
+                    <div style={{ fontSize: 9, color: "#52525b", marginTop: 1 }}>tempo totale</div>
+                  </div>
+                  <div className="stat-box" style={{ borderColor: stats.inProgress > 0 ? "rgba(96,165,250,0.25)" : "rgba(255,255,255,0.07)" }}>
+                    <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.1rem", fontWeight: 700, color: stats.inProgress > 0 ? "#93c5fd" : "#3f3f46" }}>{stats.inProgress}</div>
+                    <div style={{ fontSize: 9, color: "#52525b", marginTop: 1 }}>in corso</div>
+                  </div>
+                  <div className="stat-box" style={{ borderColor: stats.suspended > 0 ? "rgba(251,146,60,0.25)" : "rgba(255,255,255,0.07)" }}>
+                    <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.1rem", fontWeight: 700, color: stats.suspended > 0 ? "#fdba74" : "#3f3f46" }}>{stats.suspended}</div>
+                    <div style={{ fontSize: 9, color: "#52525b", marginTop: 1 }}>sospesi</div>
+                  </div>
+                  <div className="stat-box" style={{ borderColor: dtd !== null && dtd <= 5 ? (dtd < 0 ? "rgba(239,68,68,0.3)" : "rgba(251,191,36,0.3)") : "rgba(255,255,255,0.07)" }}>
+                    <div style={{ fontFamily: "Syne, sans-serif", fontSize: "1.1rem", fontWeight: 700, color: dtd === null ? "#3f3f46" : dtd < 0 ? "#f87171" : dtd <= 5 ? "#fbbf24" : "#34d399" }}>
+                      {dtd === null ? "—" : dtd < 0 ? `-${Math.abs(dtd)}g` : `${dtd}g`}
+                    </div>
+                    <div style={{ fontSize: 9, color: "#52525b", marginTop: 1 }}>alla scadenza</div>
+                  </div>
+                </div>
+
+                {/* Dates row */}
+                <div style={{ padding: "8px 16px 12px", borderTop: "1px solid rgba(255,255,255,0.05)", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                    <span style={{ fontSize: 10, color: "#52525b", whiteSpace: "nowrap" }}>🌐 Pubblicato</span>
+                    <input type="date" value={client.publishedDate || ""}
+                      onChange={(e) => setPublishedDate(client.id, e.target.value)}
+                      style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 6, padding: "3px 7px", fontSize: 11, color: "#a1a1aa", outline: "none", cursor: "pointer" }} />
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                    <span style={{ fontSize: 10, color: "#52525b", whiteSpace: "nowrap" }}>📅 Scadenza</span>
+                    <input type="date" value={dl || ""}
+                      onChange={(e) => setClientDeadline(client.id, e.target.value)}
+                      style={{ background: "rgba(255,255,255,0.04)", border: `1px solid ${dtd !== null && dtd <= 5 ? (dtd < 0 ? "rgba(239,68,68,0.4)" : "rgba(251,191,36,0.35)") : "rgba(255,255,255,0.08)"}`, borderRadius: 6, padding: "3px 7px", fontSize: 11, color: dtd !== null && dtd < 0 ? "#f87171" : "#a1a1aa", outline: "none", cursor: "pointer" }} />
+                  </div>
+                </div>
+
+                {/* Alert details */}
+                {alerts.length > 0 && (
+                  <div style={{ padding: "0 16px 12px", display: "flex", flexDirection: "column", gap: 4 }}>
+                    {alerts.map((a, i) => (
+                      <div key={i} style={{ fontSize: 11, color: alertColor[a.type], background: alertBg[a.type], borderRadius: 8, padding: "5px 10px" }}>
+                        {a.type === "danger" ? "🔴" : a.type === "analytics" ? "📊" : "⚠️"} {a.msg}
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -1426,18 +1559,13 @@ function ClientList({ onSelect }) {
         <div style={{ background: "rgba(255,255,255,0.02)", border: "2px dashed rgba(167,139,250,0.2)", borderRadius: 16, padding: "16px" }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: "#71717a", marginBottom: 10 }}>➕ Nuovo cliente</div>
           <div style={{ display: "flex", gap: 8 }}>
-            <input
-              className="edit-input-cl"
-              value={newName}
+            <input className="edit-input-cl" value={newName}
               onChange={(e) => setNewName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && addClient()}
               placeholder="Nome cliente o nome sito..."
-              style={{ flex: 1 }}
-            />
-            <button
-              onClick={addClient}
-              disabled={!newName.trim()}
-              style={{ padding: "8px 18px", borderRadius: 9, fontSize: 13, fontWeight: 700, cursor: newName.trim() ? "pointer" : "default", background: newName.trim() ? "rgba(167,139,250,0.2)" : "rgba(255,255,255,0.04)", border: `1px solid ${newName.trim() ? "rgba(167,139,250,0.4)" : "rgba(255,255,255,0.08)"}`, color: newName.trim() ? "#c4b5fd" : "#3f3f46", transition: "all 0.15s" }}>
+              style={{ flex: 1, width: "auto" }} />
+            <button onClick={addClient} disabled={!newName.trim()}
+              style={{ padding: "8px 18px", borderRadius: 9, fontSize: 13, fontWeight: 700, cursor: newName.trim() ? "pointer" : "default", background: newName.trim() ? "rgba(167,139,250,0.2)" : "rgba(255,255,255,0.04)", border: `1px solid ${newName.trim() ? "rgba(167,139,250,0.4)" : "rgba(255,255,255,0.08)"}`, color: newName.trim() ? "#c4b5fd" : "#3f3f46", transition: "all 0.15s", whiteSpace: "nowrap" }}>
               Aggiungi
             </button>
           </div>

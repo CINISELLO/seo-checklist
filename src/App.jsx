@@ -109,7 +109,7 @@ export default function App() {
   const [editingTask, setEditingTask] = useState(null); // { id, title, description, practicalGuide }
   const [editingPhase, setEditingPhase] = useState(null); // index being renamed
   // Drag state uses refs (no re-render) + a single visual indicator state
-  const pendingBackup = useRef(false); // true if structure was changed while in edit mode
+  const structureOnEditStart = useRef(null); // snapshot of structure when edit mode was activated
   const [backupCount, setBackupCount] = useState(0);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importText, setImportText] = useState("");
@@ -322,8 +322,6 @@ export default function App() {
     setStructure(newStructure);
     setTasks(merged);
     await saveStructureToSupabase(newStructure);
-    // Mark that a backup should be triggered when exiting edit mode
-    pendingBackup.current = true;
   };
 
   const handleSaveEditingTask = async () => {
@@ -619,11 +617,16 @@ export default function App() {
               <button
                 onClick={() => setEditMode((prev) => {
                   const next = !prev;
-                  if (!next && pendingBackup.current) {
-                    // Exiting edit mode with unsaved changes → trigger backup now
-                    triggerBackupDownload(tasks, structure);
-                    setBackupCount((c) => c + 1);
-                    pendingBackup.current = false;
+                  if (next) {
+                    // Entering edit mode: take a snapshot of current structure
+                    structureOnEditStart.current = JSON.stringify(structure);
+                  } else {
+                    // Exiting edit mode: backup only if structure actually changed
+                    if (structureOnEditStart.current !== JSON.stringify(structure)) {
+                      triggerBackupDownload(tasks, structure);
+                      setBackupCount((c) => c + 1);
+                    }
+                    structureOnEditStart.current = null;
                   }
                   return next;
                 })}

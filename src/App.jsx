@@ -219,7 +219,40 @@ export default function App() {
     localStorage.setItem("seo-startdate-local", startDate);
   }, [startDate]);
 
-  // ─── SAVE STATE ──────────────────────────────────────────────────────────────
+  // ─── MOBILE HEADER AUTO-HIDE ON SCROLL ───────────────────────────────────────
+  const [headerVisible, setHeaderVisible] = useState(true);
+  const [headerHeight, setHeaderHeight] = useState(0);
+  useEffect(() => {
+    const measure = () => {
+      const el = document.getElementById("app-header");
+      if (el) setHeaderHeight(el.offsetHeight);
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    // re-measure after fonts/content load
+    setTimeout(measure, 300);
+
+    let lastY = window.scrollY;
+    let ticking = false;
+    const onScroll = () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        if (window.innerWidth > 768) { setHeaderVisible(true); ticking = false; return; }
+        const currentY = window.scrollY;
+        const delta = currentY - lastY;
+        if (delta > 4) setHeaderVisible(false);
+        else if (delta < -4) setHeaderVisible(true);
+        lastY = currentY;
+        ticking = false;
+      });
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
   const saveTaskState = useCallback(async (taskId, updates, allTasks) => {
     const task = (allTasks || tasks).find((t) => t.id === taskId);
     if (!task) return;
@@ -602,7 +635,23 @@ export default function App() {
       `}</style>
 
       {/* ── STICKY HEADER ── */}
-      <div style={{ position: "sticky", top: 0, zIndex: 50, background: "#0d0d18", borderBottom: "1px solid rgba(255,255,255,0.06)", padding: "12px 16px" }}>
+      <style>{`
+        @media (max-width: 768px) {
+          .app-header {
+            position: fixed !important;
+            top: 0; left: 0; right: 0;
+            transform: translateY(0);
+            transition: transform 0.25s ease;
+          }
+          .app-header.header-hidden {
+            transform: translateY(-110%);
+          }
+        }
+      `}</style>
+      <div
+        className={`app-header${headerVisible ? "" : " header-hidden"}`}
+        id="app-header"
+        style={{ position: "sticky", top: 0, zIndex: 50, background: "#0d0d18", borderBottom: "1px solid rgba(255,255,255,0.06)", padding: "12px 16px" }}>
         <div style={{ maxWidth: 860, margin: "0 auto" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
             <div>
@@ -757,6 +806,11 @@ export default function App() {
             ))}
           </div>
         </div>
+      </div>
+
+      {/* Mobile spacer — compensates for fixed header height on small screens */}
+      <div style={{ height: 0 }} id="header-spacer">
+        <style>{`@media (max-width: 768px) { #header-spacer { height: ${headerHeight}px; } }`}</style>
       </div>
 
       {/* Suspended quick links */}

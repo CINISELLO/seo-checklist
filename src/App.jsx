@@ -86,7 +86,7 @@ function triggerBackupDownload(tasks, structure, completionMeta = null) {
 }
 
 // ─── MAIN APP ──────────────────────────────────────────────────────────────────
-export default function App() {
+function ProjectApp({ client, onBack }) {
   // Structure = ordered phases + task definitions (title/desc/guide/id)
   const [structure, setStructure] = useState(DEFAULT_CHECKLIST);
   // Tasks = runtime state (completed, timer, notes, etc.)
@@ -156,7 +156,7 @@ export default function App() {
         }));
       } else {
         // Fallback: localStorage structure
-        const localStruct = localStorage.getItem("seo-checklist-structure");
+        const localStruct = localStorage.getItem(`seo-checklist-structure-${client.id}`);
         if (localStruct) {
           try { resolvedStructure = JSON.parse(localStruct); } catch {}
         }
@@ -166,7 +166,7 @@ export default function App() {
         resolvedState = stateData;
       } else if (stateError) {
         // Fallback: localStorage state
-        const local = localStorage.getItem("seo-checklist-local");
+        const local = localStorage.getItem(`seo-checklist-local-${client.id}`);
         if (local) {
           try { resolvedState = JSON.parse(local); } catch {}
         }
@@ -193,9 +193,9 @@ export default function App() {
         return map;
       });
 
-      const dl = localStorage.getItem("seo-deadline-local");
+      const dl = localStorage.getItem(`seo-deadline-local-${client.id}`);
       if (dl) setDeadline(dl);
-      const sd = localStorage.getItem("seo-startdate-local");
+      const sd = localStorage.getItem(`seo-startdate-local-${client.id}`);
       if (sd) setStartDate(sd);
       setSyncStatus(stateError ? "error" : "ok");
       setLoaded(true);
@@ -213,40 +213,53 @@ export default function App() {
 
   // ─── DEADLINE + START DATE ────────────────────────────────────────────────────
   useEffect(() => {
-    localStorage.setItem("seo-deadline-local", deadline);
+    localStorage.setItem(`seo-deadline-local-${client.id}`, deadline);
   }, [deadline]);
   useEffect(() => {
-    localStorage.setItem("seo-startdate-local", startDate);
+    localStorage.setItem(`seo-startdate-local-${client.id}`, startDate);
   }, [startDate]);
 
-  // ─── MOBILE HEADER AUTO-HIDE ON SCROLL ───────────────────────────────────────
-  const [headerVisible, setHeaderVisible] = useState(true);
-  const [headerHeight, setHeaderHeight] = useState(0);
+  // ─── MOBILE HEADER GRADUAL HIDE ON SCROLL ────────────────────────────────────
+  const headerOffsetRef = useRef(0);
   useEffect(() => {
     const measure = () => {
       const el = document.getElementById("app-header");
-      if (el) setHeaderHeight(el.offsetHeight);
+      const spacer = document.getElementById("header-spacer");
+      if (el && spacer && window.innerWidth <= 768) {
+        spacer.style.height = el.offsetHeight + "px";
+      }
     };
     measure();
     window.addEventListener("resize", measure);
-    // re-measure after fonts/content load
     setTimeout(measure, 300);
 
     let lastY = window.scrollY;
     let ticking = false;
+
     const onScroll = () => {
       if (ticking) return;
       ticking = true;
       requestAnimationFrame(() => {
-        if (window.innerWidth > 768) { setHeaderVisible(true); ticking = false; return; }
+        if (window.innerWidth > 768) {
+          headerOffsetRef.current = 0;
+          ticking = false;
+          return;
+        }
         const currentY = window.scrollY;
         const delta = currentY - lastY;
-        if (delta > 4) setHeaderVisible(false);
-        else if (delta < -4) setHeaderVisible(true);
+        const h = document.getElementById("app-header")?.offsetHeight || 60;
+        // Accumulate offset proportionally to scroll delta
+        let newOffset = headerOffsetRef.current + delta;
+        newOffset = Math.max(0, Math.min(h, newOffset));
+        headerOffsetRef.current = newOffset;
+        // Apply directly to DOM to avoid React re-render on every pixel
+        const el = document.getElementById("app-header");
+        if (el) el.style.transform = `translateY(-${newOffset}px)`;
         lastY = currentY;
         ticking = false;
       });
     };
+
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => {
       window.removeEventListener("scroll", onScroll);
@@ -270,7 +283,7 @@ export default function App() {
     setSyncStatus(error ? "error" : "ok");
     // always backup locally
     const next = (allTasks || tasks).map((t) => t.id === taskId ? { ...t, ...updates } : t);
-    localStorage.setItem("seo-checklist-local", JSON.stringify(
+    localStorage.setItem(`seo-checklist-local-${client.id}`, JSON.stringify(
       next.map((t) => ({ id: t.id, completed: t.completed, status: t.status, totalSeconds: t.totalSeconds + t.sessionSeconds, notes: t.notes, suspended: t.suspended }))
     ));
   }, [tasks]);
@@ -341,7 +354,7 @@ export default function App() {
       setSyncStatus("ok");
     }
     // Always save locally too
-    localStorage.setItem("seo-checklist-structure", JSON.stringify(newStructure));
+    localStorage.setItem(`seo-checklist-structure-${client.id}`, JSON.stringify(newStructure));
   };
 
   // ─── EDIT MODE ACTIONS ────────────────────────────────────────────────────────
@@ -457,7 +470,7 @@ export default function App() {
       setStructure(newStructure);
       setTasks(merged);
       await saveStructureToSupabase(newStructure);
-      localStorage.setItem("seo-checklist-local", JSON.stringify(
+      localStorage.setItem(`seo-checklist-local-${client.id}`, JSON.stringify(
         merged.map((t) => ({ id: t.id, completed: t.completed, status: t.status, totalSeconds: t.totalSeconds, notes: t.notes, suspended: t.suspended }))
       ));
       setSyncStatus("ok");
@@ -640,22 +653,24 @@ export default function App() {
           .app-header {
             position: fixed !important;
             top: 0; left: 0; right: 0;
-            transform: translateY(0);
-            transition: transform 0.25s ease;
-          }
-          .app-header.header-hidden {
-            transform: translateY(-110%);
           }
         }
       `}</style>
       <div
-        className={`app-header${headerVisible ? "" : " header-hidden"}`}
+        className="app-header"
         id="app-header"
         style={{ position: "sticky", top: 0, zIndex: 50, background: "#0d0d18", borderBottom: "1px solid rgba(255,255,255,0.06)", padding: "12px 16px" }}>
         <div style={{ maxWidth: 860, margin: "0 auto" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
             <div>
-              <h1 style={{ fontFamily: "Syne, sans-serif", fontSize: "clamp(1.3rem,4vw,1.8rem)", fontWeight: 800, letterSpacing: "-0.03em", margin: 0 }}>SEO Checklist</h1>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <button onClick={onBack} title="Torna alla lista clienti"
+                  style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 8, color: "#a1a1aa", cursor: "pointer", fontSize: 18, lineHeight: 1, padding: "4px 8px", display: "flex", alignItems: "center" }}>←</button>
+                <div>
+                  <h1 style={{ fontFamily: "Syne, sans-serif", fontSize: "clamp(1.1rem,4vw,1.6rem)", fontWeight: 800, letterSpacing: "-0.03em", margin: 0 }}>{client.name}</h1>
+                  <div style={{ fontSize: 10, color: "#52525b", marginTop: 1 }}>SEO Checklist</div>
+                </div>
+              </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
                 <span style={{ fontSize: 11, color: "#52525b" }}>WordPress · Elementor Pro · Rank Math</span>
                 <SyncDot />
@@ -809,8 +824,8 @@ export default function App() {
       </div>
 
       {/* Mobile spacer — compensates for fixed header height on small screens */}
-      <div style={{ height: 0 }} id="header-spacer">
-        <style>{`@media (max-width: 768px) { #header-spacer { height: ${headerHeight}px; } }`}</style>
+      <div id="header-spacer" style={{ display: "none" }}>
+        <style>{`@media (max-width: 768px) { #header-spacer { display: block; } }`}</style>
       </div>
 
       {/* Suspended quick links */}
@@ -1231,4 +1246,214 @@ function PhaseNameEditor({ initialName, onSave, onCancel }) {
       <button onClick={onCancel} style={{ padding: "4px 10px", borderRadius: 7, fontSize: 11, fontWeight: 700, cursor: "pointer", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#71717a" }}>✕</button>
     </div>
   );
+}
+
+// ─── CLIENT LIST ───────────────────────────────────────────────────────────────
+function ClientList({ onSelect }) {
+  const STORAGE_KEY = "seo-clients-list";
+
+  const loadClients = () => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; } catch { return []; }
+  };
+
+  const [clients, setClients] = useState(loadClients);
+  const [newName, setNewName] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editingName, setEditingName] = useState("");
+
+  const saveClients = (list) => {
+    setClients(list);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+  };
+
+  const addClient = () => {
+    const name = newName.trim();
+    if (!name) return;
+    const client = { id: `client-${Date.now()}`, name, createdAt: new Date().toISOString(), publishedDate: null };
+    saveClients([...clients, client]);
+    setNewName("");
+  };
+
+  const deleteClient = (id) => {
+    if (!window.confirm("Eliminare questo cliente? I dati locali rimarranno ma non sarà più visibile.")) return;
+    saveClients(clients.filter((c) => c.id !== id));
+  };
+
+  const setPublishedDate = (id, date) => {
+    saveClients(clients.map((c) => c.id === id ? { ...c, publishedDate: date } : c));
+  };
+
+  const startEdit = (client) => {
+    setEditingId(client.id);
+    setEditingName(client.name);
+  };
+
+  const saveEdit = (id) => {
+    const name = editingName.trim();
+    if (!name) return;
+    saveClients(clients.map((c) => c.id === id ? { ...c, name } : c));
+    setEditingId(null);
+  };
+
+  // Analytics reminder: show badge if publishedDate is set and >= 30 days ago
+  const needsAnalytics = (client) => {
+    if (!client.publishedDate) return false;
+    const pub = new Date(client.publishedDate);
+    const now = new Date();
+    const daysSince = Math.floor((now - pub) / 86400000);
+    return daysSince >= 30;
+  };
+
+  const daysSincePublish = (client) => {
+    if (!client.publishedDate) return null;
+    return Math.floor((new Date() - new Date(client.publishedDate)) / 86400000);
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#0a0a0f", color: "#fff", fontFamily: "'DM Sans', sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500;600&display=swap');
+        * { box-sizing: border-box; }
+        .client-card { transition: transform 0.15s ease, border-color 0.15s ease; cursor: pointer; }
+        .client-card:hover { transform: translateY(-2px); }
+        .edit-input-cl { background: rgba(167,139,250,0.08); border: 1px solid rgba(167,139,250,0.3); border-radius: 8px; padding: 7px 10px; font-size: 14px; color: #e4e4e7; outline: none; font-family: inherit; }
+        .edit-input-cl:focus { border-color: rgba(167,139,250,0.7); }
+      `}</style>
+
+      <div style={{ maxWidth: 700, margin: "0 auto", padding: "40px 16px" }}>
+        {/* Header */}
+        <div style={{ marginBottom: 36, textAlign: "center" }}>
+          <h1 style={{ fontFamily: "Syne, sans-serif", fontSize: "clamp(1.8rem,6vw,2.6rem)", fontWeight: 800, letterSpacing: "-0.04em", margin: 0, background: "linear-gradient(135deg,#a78bfa,#60a5fa)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+            I tuoi clienti
+          </h1>
+          <p style={{ color: "#52525b", fontSize: 14, marginTop: 6 }}>Seleziona un cliente per aprire la sua SEO checklist</p>
+        </div>
+
+        {/* Analytics reminders banner */}
+        {clients.some(needsAnalytics) && (
+          <div style={{ marginBottom: 20, background: "rgba(251,146,60,0.08)", border: "1px solid rgba(251,146,60,0.25)", borderRadius: 14, padding: "12px 16px" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#fb923c", marginBottom: 6 }}>📊 Promemoria Analytics mensile</div>
+            {clients.filter(needsAnalytics).map((c) => (
+              <div key={c.id} style={{ fontSize: 12, color: "#fdba74", marginBottom: 2 }}>
+                • <strong>{c.name}</strong> — pubblicato {daysSincePublish(c)} giorni fa, rendiconto analytics in scadenza
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Client cards */}
+        {clients.length === 0 && (
+          <div style={{ textAlign: "center", padding: "40px 0", color: "#3f3f46" }}>
+            <div style={{ fontSize: 40, marginBottom: 8 }}>👤</div>
+            <p style={{ fontSize: 14 }}>Nessun cliente ancora. Aggiungine uno sotto.</p>
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+          {clients.map((client) => {
+            const analytics = needsAnalytics(client);
+            const days = daysSincePublish(client);
+            return (
+              <div
+                key={client.id}
+                className="client-card"
+                style={{
+                  background: "rgba(255,255,255,0.025)",
+                  border: `1px solid ${analytics ? "rgba(251,146,60,0.35)" : "rgba(255,255,255,0.08)"}`,
+                  borderRadius: 16,
+                  padding: "14px 16px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                  flexWrap: "wrap",
+                }}>
+                {/* Name / edit */}
+                <div style={{ flex: 1, minWidth: 0 }} onClick={() => !editingId && onSelect(client)}>
+                  {editingId === client.id ? (
+                    <div style={{ display: "flex", gap: 6, alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
+                      <input
+                        className="edit-input-cl"
+                        value={editingName}
+                        onChange={(e) => setEditingName(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") saveEdit(client.id); if (e.key === "Escape") setEditingId(null); }}
+                        autoFocus
+                        style={{ flex: 1 }}
+                      />
+                      <button onClick={() => saveEdit(client.id)} style={{ padding: "5px 10px", borderRadius: 7, fontSize: 11, fontWeight: 700, cursor: "pointer", background: "rgba(52,211,153,0.15)", border: "1px solid rgba(52,211,153,0.3)", color: "#6ee7b7" }}>✓</button>
+                      <button onClick={() => setEditingId(null)} style={{ padding: "5px 10px", borderRadius: 7, fontSize: 11, fontWeight: 700, cursor: "pointer", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#71717a" }}>✕</button>
+                    </div>
+                  ) : (
+                    <div>
+                      <div style={{ fontFamily: "Syne, sans-serif", fontWeight: 700, fontSize: "1rem", color: "#e4e4e7", display: "flex", alignItems: "center", gap: 8 }}>
+                        {client.name}
+                        {analytics && <span style={{ fontSize: 10, background: "rgba(251,146,60,0.2)", border: "1px solid rgba(251,146,60,0.35)", borderRadius: 20, padding: "2px 7px", color: "#fb923c", fontFamily: "inherit", fontWeight: 600 }}>📊 Analytics</span>}
+                      </div>
+                      <div style={{ fontSize: 11, color: "#52525b", marginTop: 2 }}>
+                        Creato il {new Date(client.createdAt).toLocaleDateString("it-IT")}
+                        {client.publishedDate && ` · Pubblicato il ${new Date(client.publishedDate).toLocaleDateString("it-IT")}${days !== null ? ` (${days}g fa)` : ""}`}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Published date setter */}
+                {!editingId && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
+                    <span style={{ fontSize: 10, color: "#52525b", whiteSpace: "nowrap" }}>🌐 Pubblicato</span>
+                    <input
+                      type="date"
+                      value={client.publishedDate || ""}
+                      onChange={(e) => setPublishedDate(client.id, e.target.value)}
+                      style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 7, padding: "4px 8px", fontSize: 11, color: "#a1a1aa", outline: "none", cursor: "pointer" }}
+                    />
+                  </div>
+                )}
+
+                {/* Actions */}
+                {!editingId && (
+                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
+                    <button onClick={() => startEdit(client)} style={{ padding: "5px 10px", borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: "pointer", background: "rgba(167,139,250,0.1)", border: "1px solid rgba(167,139,250,0.2)", color: "#c4b5fd" }}>✏️</button>
+                    <button onClick={() => deleteClient(client.id)} style={{ padding: "5px 10px", borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: "pointer", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", color: "#fca5a5" }}>🗑️</button>
+                    <button onClick={() => onSelect(client)} style={{ padding: "5px 14px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer", background: "rgba(167,139,250,0.15)", border: "1px solid rgba(167,139,250,0.3)", color: "#c4b5fd" }}>Apri →</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Add new client */}
+        <div style={{ background: "rgba(255,255,255,0.02)", border: "2px dashed rgba(167,139,250,0.2)", borderRadius: 16, padding: "16px" }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#71717a", marginBottom: 10 }}>➕ Nuovo cliente</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              className="edit-input-cl"
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addClient()}
+              placeholder="Nome cliente o nome sito..."
+              style={{ flex: 1 }}
+            />
+            <button
+              onClick={addClient}
+              disabled={!newName.trim()}
+              style={{ padding: "8px 18px", borderRadius: 9, fontSize: 13, fontWeight: 700, cursor: newName.trim() ? "pointer" : "default", background: newName.trim() ? "rgba(167,139,250,0.2)" : "rgba(255,255,255,0.04)", border: `1px solid ${newName.trim() ? "rgba(167,139,250,0.4)" : "rgba(255,255,255,0.08)"}`, color: newName.trim() ? "#c4b5fd" : "#3f3f46", transition: "all 0.15s" }}>
+              Aggiungi
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ROOT APP ──────────────────────────────────────────────────────────────────
+export default function App() {
+  const [selectedClient, setSelectedClient] = useState(null);
+
+  if (!selectedClient) {
+    return <ClientList onSelect={(client) => setSelectedClient(client)} />;
+  }
+
+  return <ProjectApp client={selectedClient} onBack={() => setSelectedClient(null)} />;
 }

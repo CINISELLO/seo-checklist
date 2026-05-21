@@ -201,7 +201,10 @@ export default function App() {
     grouped.map((s) => ({
       ...s,
       items: s.items.filter((t) => {
-        const q = t.title.toLowerCase().includes(search.toLowerCase());
+        const q_lower = search.toLowerCase();
+        const q = t.title.toLowerCase().includes(q_lower) ||
+          (t.description || "").toLowerCase().includes(q_lower) ||
+          (t.practicalGuide || "").toLowerCase().includes(q_lower);
         if (activeTab === "suspended") return q && t.suspended;
         if (activeTab === "inprogress") return q && t.status === "In corso";
         if (activeTab === "todo") return q && !t.completed;

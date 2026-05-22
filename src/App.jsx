@@ -1320,6 +1320,9 @@ function ClientList({ onSelect }) {
   useEffect(() => {
     async function loadFromSupabase() {
       const { data, error } = await supabase.from("clients").select("*").order("created_at");
+      if (error) {
+        console.error("Supabase clients load error:", error.message, error.code, error.details);
+      }
       if (data && data.length > 0) {
         const mapped = data.map((r) => ({
           id: r.id,
@@ -1330,12 +1333,35 @@ function ClientList({ onSelect }) {
           startDate: r.start_date || null,
         }));
         saveClientsLocal(mapped);
-      } else {
-        // fallback to localStorage
+      } else if (error) {
+        // fallback to localStorage on error — already loaded via useState(loadClients)
+        console.warn("Using localStorage fallback for clients");
       }
       setLoadingClients(false);
     }
     loadFromSupabase();
+
+    // ── Realtime subscription — sync clients across devices ──
+    const channel = supabase
+      .channel("clients-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "clients" }, async () => {
+        // Reload all clients from Supabase when any change is detected
+        const { data } = await supabase.from("clients").select("*").order("created_at");
+        if (data && data.length > 0) {
+          const mapped = data.map((r) => ({
+            id: r.id,
+            name: r.name,
+            createdAt: r.created_at,
+            publishedDate: r.published_date || null,
+            deadline: r.deadline || null,
+            startDate: r.start_date || null,
+          }));
+          saveClientsLocal(mapped);
+        }
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
   }, []);
 
   const saveClientsLocal = (list) => {
@@ -1345,16 +1371,19 @@ function ClientList({ onSelect }) {
 
   const saveClientsRemote = async (list) => {
     saveClientsLocal(list);
-    // Upsert all to Supabase
-    const rows = list.map((c) => ({
-      id: c.id,
-      name: c.name,
-      created_at: c.createdAt,
-      published_date: c.publishedDate || null,
-      deadline: c.deadline || null,
-      start_date: c.startDate || null,
-    }));
-    await supabase.from("clients").upsert(rows);
+    // Upsert each client individually to Supabase (more reliable)
+    for (const c of list) {
+      const row = {
+        id: c.id,
+        name: c.name,
+        created_at: c.createdAt,
+        published_date: c.publishedDate || null,
+        deadline: c.deadline || null,
+        start_date: c.startDate || null,
+      };
+      const { error } = await supabase.from("clients").upsert(row);
+      if (error) console.error("Supabase upsert client error:", error.message, error.code, JSON.stringify(error));
+    }
   };
 
   const addClient = async () => {
@@ -1501,6 +1530,18 @@ function ClientList({ onSelect }) {
           <p style={{ color: "#52525b", fontSize: 13, marginTop: 4 }}>
             {clients.length > 0 ? `${clients.length} progetti · seleziona per aprire la checklist` : "Seleziona un cliente per aprire la sua SEO checklist"}
           </p>
+          <button onClick={async () => {
+            setLoadingClients(true);
+            const { data, error } = await supabase.from("clients").select("*").order("created_at");
+            if (error) console.error("Refresh error:", error.message);
+            if (data && data.length > 0) {
+              const mapped = data.map((r) => ({ id: r.id, name: r.name, createdAt: r.created_at, publishedDate: r.published_date || null, deadline: r.deadline || null, startDate: r.start_date || null }));
+              saveClientsLocal(mapped);
+            }
+            setLoadingClients(false);
+          }} style={{ marginTop: 10, padding: "5px 14px", borderRadius: 8, fontSize: 11, cursor: "pointer", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#71717a" }}>
+            🔄 Aggiorna da server
+          </button>
         </div>
 
         {/* ── GLOBAL ALERTS BANNER ── */}

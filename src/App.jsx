@@ -58,11 +58,30 @@ function buildStructureFromTasks(tasks, phases) {
 }
 
 // ─── AUTO-BACKUP ───────────────────────────────────────────────────────────────
-function triggerBackupDownload(tasks, structure, completionMeta = null) {
+function triggerBackupDownload(tasks, structure, completionMeta = null, clientName = null) {
+  // Read all clients from localStorage for full backup
+  let allClients = [];
+  try { allClients = JSON.parse(localStorage.getItem("seo-clients-list")) || []; } catch {}
+
+  // For each client, read their task state and structure from localStorage
+  const allClientsData = allClients.map((c) => {
+    let clientStructure = null;
+    let clientState = [];
+    try { clientStructure = JSON.parse(localStorage.getItem(`seo-checklist-structure-${c.id}`)); } catch {}
+    try { clientState = JSON.parse(localStorage.getItem(`seo-checklist-local-${c.id}`)) || []; } catch {}
+    return {
+      ...c,
+      structure: clientStructure,
+      taskState: clientState,
+    };
+  });
+
   const backup = {
-    version: 2,
+    version: 3,
     exportedAt: new Date().toISOString(),
     ...(completionMeta ? { completedAt: completionMeta.completedAt, completionNotes: completionMeta.notes, startDate: completionMeta.startDate, deadline: completionMeta.deadline, type: "completion" } : {}),
+    // Current open project
+    currentClient: clientName,
     structure: structure,
     taskState: tasks.map((t) => ({
       id: t.id,
@@ -72,6 +91,8 @@ function triggerBackupDownload(tasks, structure, completionMeta = null) {
       notes: t.notes,
       suspended: t.suspended,
     })),
+    // Full snapshot of all clients
+    allClients: allClientsData,
   };
   const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
@@ -219,7 +240,7 @@ function ProjectApp({ client, onBack }) {
   useEffect(() => { structureRef.current = structure; }, [structure]);
   useEffect(() => {
     const iv = setInterval(() => {
-      triggerBackupDownload(tasksRef.current, structureRef.current);
+      triggerBackupDownload(tasksRef.current, structureRef.current, null, client.name);
       setBackupCount((c) => c + 1);
       setLastAutoBackup(new Date());
     }, 20 * 60 * 1000);
@@ -468,7 +489,7 @@ function ProjectApp({ client, onBack }) {
 
   // ─── BACKUP / IMPORT ─────────────────────────────────────────────────────────
   const handleManualBackup = () => {
-    triggerBackupDownload(tasks, structure);
+    triggerBackupDownload(tasks, structure, null, client.name);
     setBackupCount((c) => c + 1);
   };
 
@@ -524,7 +545,7 @@ function ProjectApp({ client, onBack }) {
       notes: completionNotes,
       startDate,
       deadline,
-    });
+    }, client.name);
     setBackupCount((c) => c + 1);
     setShowCompletionModal(false);
     setCompletionNotes("");
@@ -709,7 +730,7 @@ function ProjectApp({ client, onBack }) {
                   } else {
                     // Exiting edit mode: backup only if structure actually changed
                     if (structureOnEditStart.current !== JSON.stringify(structure)) {
-                      triggerBackupDownload(tasks, structure);
+                      triggerBackupDownload(tasks, structure, null, client.name);
                       setBackupCount((c) => c + 1);
                     }
                     structureOnEditStart.current = null;
@@ -1285,44 +1306,104 @@ function ClientList({ onSelect }) {
   };
 
   const [clients, setClients] = useState(loadClients);
-  const [newName, setNewName] = useState("");
   const [editingId, setEditingId] = useState(null);
   const [editingName, setEditingName] = useState("");
-  const [newDeadlines, setNewDeadlines] = useState({});
+  const [loadingClients, setLoadingClients] = useState(true);
 
-  const saveClients = (list) => {
+  // New client form
+  const [newName, setNewName] = useState("");
+  const [newStartDate, setNewStartDate] = useState("");
+  const [newDeadline, setNewDeadline] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  // ── Load clients from Supabase on mount, merge with localStorage ──
+  useEffect(() => {
+    async function loadFromSupabase() {
+      const { data, error } = await supabase.from("clients").select("*").order("created_at");
+      if (data && data.length > 0) {
+        const mapped = data.map((r) => ({
+          id: r.id,
+          name: r.name,
+          createdAt: r.created_at,
+          publishedDate: r.published_date || null,
+          deadline: r.deadline || null,
+          startDate: r.start_date || null,
+        }));
+        saveClientsLocal(mapped);
+      } else {
+        // fallback to localStorage
+      }
+      setLoadingClients(false);
+    }
+    loadFromSupabase();
+  }, []);
+
+  const saveClientsLocal = (list) => {
     setClients(list);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
   };
 
-  const addClient = () => {
+  const saveClientsRemote = async (list) => {
+    saveClientsLocal(list);
+    // Upsert all to Supabase
+    const rows = list.map((c) => ({
+      id: c.id,
+      name: c.name,
+      created_at: c.createdAt,
+      published_date: c.publishedDate || null,
+      deadline: c.deadline || null,
+      start_date: c.startDate || null,
+    }));
+    await supabase.from("clients").upsert(rows);
+  };
+
+  const addClient = async () => {
     const name = newName.trim();
     if (!name) return;
-    const client = { id: `client-${Date.now()}`, name, createdAt: new Date().toISOString(), publishedDate: null, deadline: null };
-    saveClients([...clients, client]);
+    setSaving(true);
+    const client = {
+      id: `client-${Date.now()}`,
+      name,
+      createdAt: new Date().toISOString(),
+      publishedDate: null,
+      deadline: newDeadline || null,
+      startDate: newStartDate || null,
+    };
+    const newList = [...clients, client];
+    await saveClientsRemote(newList);
+    // Also sync dates to per-client localStorage keys used by ProjectApp
+    if (newStartDate) localStorage.setItem(`seo-startdate-local-${client.id}`, newStartDate);
+    if (newDeadline) localStorage.setItem(`seo-deadline-local-${client.id}`, newDeadline);
     setNewName("");
+    setNewStartDate("");
+    setNewDeadline("");
+    setSaving(false);
   };
 
-  const deleteClient = (id) => {
+  const deleteClient = async (id) => {
     if (!window.confirm("Eliminare questo cliente? I dati locali rimarranno ma non sarà più visibile.")) return;
-    saveClients(clients.filter((c) => c.id !== id));
+    const newList = clients.filter((c) => c.id !== id);
+    await saveClientsRemote(newList);
+    await supabase.from("clients").delete().eq("id", id);
   };
 
-  const setPublishedDate = (id, date) => {
-    saveClients(clients.map((c) => c.id === id ? { ...c, publishedDate: date } : c));
+  const setPublishedDate = async (id, date) => {
+    const newList = clients.map((c) => c.id === id ? { ...c, publishedDate: date } : c);
+    await saveClientsRemote(newList);
   };
 
-  const setClientDeadline = (id, date) => {
-    saveClients(clients.map((c) => c.id === id ? { ...c, deadline: date } : c));
-    // Also sync to the per-client localStorage deadline key
+  const setClientDeadline = async (id, date) => {
+    const newList = clients.map((c) => c.id === id ? { ...c, deadline: date } : c);
+    await saveClientsRemote(newList);
     localStorage.setItem(`seo-deadline-local-${id}`, date);
   };
 
   const startEdit = (client) => { setEditingId(client.id); setEditingName(client.name); };
-  const saveEdit = (id) => {
+  const saveEdit = async (id) => {
     const name = editingName.trim();
     if (!name) return;
-    saveClients(clients.map((c) => c.id === id ? { ...c, name } : c));
+    const newList = clients.map((c) => c.id === id ? { ...c, name } : c);
+    await saveClientsRemote(newList);
     setEditingId(null);
   };
 
@@ -1403,7 +1484,14 @@ function ClientList({ onSelect }) {
         input[type=date]::-webkit-calendar-picker-indicator { filter: invert(1) opacity(0.4); }
       `}</style>
 
-      <div style={{ maxWidth: 780, margin: "0 auto", padding: "32px 16px 60px" }}>
+      {loadingClients && (
+        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", paddingTop: 80, flexDirection: "column", gap: 12 }}>
+          <div style={{ width: 32, height: 32, border: "3px solid #333", borderTop: "3px solid #a78bfa", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+          <p style={{ color: "#52525b", fontSize: 13 }}>Caricamento clienti...</p>
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        </div>
+      )}
+      {!loadingClients && <div style={{ maxWidth: 780, margin: "0 auto", padding: "32px 16px 60px" }}>
 
         {/* Header */}
         <div style={{ marginBottom: 28, textAlign: "center" }}>
@@ -1556,21 +1644,33 @@ function ClientList({ onSelect }) {
         </div>
 
         {/* Add new client */}
-        <div style={{ background: "rgba(255,255,255,0.02)", border: "2px dashed rgba(167,139,250,0.2)", borderRadius: 16, padding: "16px" }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: "#71717a", marginBottom: 10 }}>➕ Nuovo cliente</div>
-          <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ background: "rgba(255,255,255,0.02)", border: "2px dashed rgba(167,139,250,0.2)", borderRadius: 16, padding: "18px" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#a78bfa", marginBottom: 14 }}>➕ Nuovo cliente</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <input className="edit-input-cl" value={newName}
               onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addClient()}
+              onKeyDown={(e) => e.key === "Enter" && newName.trim() && addClient()}
               placeholder="Nome cliente o nome sito..."
-              style={{ flex: 1, width: "auto" }} />
-            <button onClick={addClient} disabled={!newName.trim()}
-              style={{ padding: "8px 18px", borderRadius: 9, fontSize: 13, fontWeight: 700, cursor: newName.trim() ? "pointer" : "default", background: newName.trim() ? "rgba(167,139,250,0.2)" : "rgba(255,255,255,0.04)", border: `1px solid ${newName.trim() ? "rgba(167,139,250,0.4)" : "rgba(255,255,255,0.08)"}`, color: newName.trim() ? "#c4b5fd" : "#3f3f46", transition: "all 0.15s", whiteSpace: "nowrap" }}>
-              Aggiungi
+              style={{ width: "100%" }} />
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "6px 10px", flex: 1, minWidth: 150 }}>
+                <span style={{ fontSize: 10, color: "#52525b", whiteSpace: "nowrap" }}>🗓 Inizio</span>
+                <input type="date" value={newStartDate} onChange={(e) => setNewStartDate(e.target.value)}
+                  style={{ background: "none", border: "none", fontSize: 12, color: "#a1a1aa", outline: "none", cursor: "pointer", flex: 1 }} />
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "6px 10px", flex: 1, minWidth: 150 }}>
+                <span style={{ fontSize: 10, color: "#52525b", whiteSpace: "nowrap" }}>📅 Scadenza</span>
+                <input type="date" value={newDeadline} onChange={(e) => setNewDeadline(e.target.value)}
+                  style={{ background: "none", border: "none", fontSize: 12, color: "#a1a1aa", outline: "none", cursor: "pointer", flex: 1 }} />
+              </div>
+            </div>
+            <button onClick={addClient} disabled={!newName.trim() || saving}
+              style={{ padding: "10px 18px", borderRadius: 9, fontSize: 13, fontWeight: 700, cursor: newName.trim() && !saving ? "pointer" : "default", background: newName.trim() && !saving ? "rgba(167,139,250,0.2)" : "rgba(255,255,255,0.04)", border: `1px solid ${newName.trim() && !saving ? "rgba(167,139,250,0.4)" : "rgba(255,255,255,0.08)"}`, color: newName.trim() && !saving ? "#c4b5fd" : "#3f3f46", transition: "all 0.15s" }}>
+              {saving ? "⏳ Salvataggio..." : "➕ Aggiungi cliente"}
             </button>
           </div>
         </div>
-      </div>
+      </div>}
     </div>
   );
 }
@@ -1580,7 +1680,12 @@ export default function App() {
   const [selectedClient, setSelectedClient] = useState(null);
 
   if (!selectedClient) {
-    return <ClientList onSelect={(client) => setSelectedClient(client)} />;
+    return <ClientList onSelect={(client) => {
+      // Sync client-level dates to per-client localStorage keys so ProjectApp picks them up
+      if (client.startDate) localStorage.setItem(`seo-startdate-local-${client.id}`, client.startDate);
+      if (client.deadline) localStorage.setItem(`seo-deadline-local-${client.id}`, client.deadline);
+      setSelectedClient(client);
+    }} />;
   }
 
   return <ProjectApp client={selectedClient} onBack={() => setSelectedClient(null)} />;

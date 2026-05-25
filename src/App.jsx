@@ -223,7 +223,20 @@ function ProjectApp({ client, onBack }) {
         return map;
       });
 
-      // If structure was not in Supabase yet, save it now so stats are correct on all devices
+      // First time opening this client: initialize ALL task rows on Supabase so stats are always correct
+      if (!stateData || stateData.length === 0) {
+        const initRows = fresh.map((t) => ({
+          id: t.id,
+          completed: false,
+          status: "Da fare",
+          total_seconds: 0,
+          notes: "",
+          suspended: false,
+        }));
+        await supabase.from("checklist_tasks").upsert(initRows);
+      }
+
+      // Save structure to Supabase if not there yet
       if (!structData || structData.length === 0) {
         await saveStructureToSupabase(resolvedStructure);
       }
@@ -1747,23 +1760,20 @@ export default function App() {
   const [taskStats, setTaskStats] = useState({}); // { [clientId]: stats } — lives here so it survives navigation
 
   const updateStatsForClient = async (clientId) => {
-    const [{ data: taskData }, { data: structData }] = await Promise.all([
-      supabase.from("checklist_tasks").select("*").like("id", `${clientId}__%`),
-      supabase.from("checklist_structure").select("id").like("id", `${clientId}__%`),
-    ]);
-    if (taskData !== null) {
-      // totalTasks comes from structure (all tasks), not from checklist_tasks (only touched tasks)
-      const totalTasks = structData ? structData.length : taskData.length;
-      const completed = taskData.filter((r) => r.completed).length;
-      const inProgress = taskData.filter((r) => r.status === "In corso" && !r.completed).length;
-      const suspended = taskData.filter((r) => r.suspended && !r.completed).length;
-      const totalSeconds = taskData.reduce((a, r) => a + (r.total_seconds || 0), 0);
+    // checklist_tasks always has all rows (initialized on first client open)
+    const { data } = await supabase.from("checklist_tasks").select("*").like("id", `${clientId}__%`);
+    if (data !== null) {
+      const totalTasks = data.length;
+      const completed = data.filter((r) => r.completed).length;
+      const inProgress = data.filter((r) => r.status === "In corso" && !r.completed).length;
+      const suspended = data.filter((r) => r.suspended && !r.completed).length;
+      const totalSeconds = data.reduce((a, r) => a + (r.total_seconds || 0), 0);
       setTaskStats((prev) => ({
         ...prev,
         [clientId]: { totalTasks, completed, inProgress, suspended, totalSeconds, hasData: totalTasks > 0 },
       }));
       localStorage.setItem(`seo-checklist-local-${clientId}`, JSON.stringify(
-        taskData.map((r) => ({ id: r.id, completed: r.completed ?? false, status: r.status ?? "Da fare", totalSeconds: r.total_seconds ?? 0, notes: r.notes ?? "", suspended: r.suspended ?? false }))
+        data.map((r) => ({ id: r.id, completed: r.completed ?? false, status: r.status ?? "Da fare", totalSeconds: r.total_seconds ?? 0, notes: r.notes ?? "", suspended: r.suspended ?? false }))
       ));
     }
   };
@@ -1772,38 +1782,27 @@ export default function App() {
   useEffect(() => {
     // Load stats for ALL clients at startup (one query, no per-client round trips)
     const loadAllStats = async () => {
-      const [{ data: taskData }, { data: structData }] = await Promise.all([
-        supabase.from("checklist_tasks").select("id,completed,status,total_seconds,suspended"),
-        supabase.from("checklist_structure").select("id"),
-      ]);
-      // Build a map of clientId → total task count from structure
-      const structByClient = {};
-      (structData || []).forEach((r) => {
-        const clientId = r.id.split("__")[0];
-        if (!clientId.startsWith("client-")) return;
-        structByClient[clientId] = (structByClient[clientId] || 0) + 1;
-      });
-      // Group task state by client
+      // checklist_tasks always has all rows after first client open — simple group by client
+      const { data } = await supabase
+        .from("checklist_tasks")
+        .select("id,completed,status,total_seconds,suspended");
+      if (!data || data.length === 0) return;
       const byClient = {};
-      (taskData || []).forEach((r) => {
+      data.forEach((r) => {
         const clientId = r.id.split("__")[0];
         if (!clientId.startsWith("client-")) return;
         if (!byClient[clientId]) byClient[clientId] = [];
         byClient[clientId].push(r);
       });
-      // Merge: all clients that have a structure entry get stats
-      const allClientIds = new Set([...Object.keys(structByClient), ...Object.keys(byClient)]);
       const stats = {};
-      allClientIds.forEach((cid) => {
-        const rows = byClient[cid] || [];
-        const totalTasks = structByClient[cid] || rows.length;
+      Object.entries(byClient).forEach(([cid, rows]) => {
         stats[cid] = {
-          totalTasks,
+          totalTasks: rows.length,
           completed: rows.filter((r) => r.completed).length,
           inProgress: rows.filter((r) => r.status === "In corso" && !r.completed).length,
           suspended: rows.filter((r) => r.suspended && !r.completed).length,
           totalSeconds: rows.reduce((a, r) => a + (r.total_seconds || 0), 0),
-          hasData: totalTasks > 0,
+          hasData: true,
         };
       });
       setTaskStats(stats);

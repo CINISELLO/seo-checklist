@@ -1332,7 +1332,7 @@ function PhaseNameEditor({ initialName, onSave, onCancel }) {
 }
 
 // ─── CLIENT LIST ───────────────────────────────────────────────────────────────
-function ClientList({ onSelect }) {
+function ClientList({ onSelect, taskStats = {}, setTaskStats = () => {} }) {
   const STORAGE_KEY = "seo-clients-list";
 
   const loadClients = () => {
@@ -1349,7 +1349,18 @@ function ClientList({ onSelect }) {
   const [newStartDate, setNewStartDate] = useState("");
   const [newDeadline, setNewDeadline] = useState("");
   const [saving, setSaving] = useState(false);
-  const [taskSyncTick, setTaskSyncTick] = useState(0); // bumped when remote task changes arrive
+  // ── Compute stats from raw Supabase rows and store in React state ──
+  const updateStatsFromRows = (clientId, rows) => {
+    const totalTasks = rows.length;
+    const completed = rows.filter((r) => r.completed).length;
+    const inProgress = rows.filter((r) => r.status === "In corso" && !r.completed).length;
+    const suspended = rows.filter((r) => r.suspended && !r.completed).length;
+    const totalSeconds = rows.reduce((a, r) => a + (r.total_seconds || 0), 0);
+    setTaskStats((prev) => ({
+      ...prev,
+      [clientId]: { totalTasks, completed, inProgress, suspended, totalSeconds, hasData: totalTasks > 0 },
+    }));
+  };
 
   // ── Load clients from Supabase on mount, merge with localStorage ──
   useEffect(() => {
@@ -1406,7 +1417,7 @@ function ClientList({ onSelect }) {
               localStorage.setItem(cacheKey, JSON.stringify(updated));
             }
           }
-          setTaskSyncTick((n) => n + 1);
+
         }
       } else {
         console.warn("Using localStorage fallback for clients");
@@ -1433,39 +1444,7 @@ function ClientList({ onSelect }) {
           saveClientsLocal(mapped);
         }
       })
-      .on("postgres_changes", { event: "*", schema: "public", table: "checklist_tasks" }, async (payload) => {
-        // Task IDs are prefixed with client_id (e.g. "client-123__0-1")
-        // so we can extract the client directly from the changed row ID
-        const changedRow = payload.new || payload.old;
-        if (!changedRow || !changedRow.id) return;
-        const parts = changedRow.id.split("__");
-        if (parts.length < 2) return;
-        const clientId = parts[0];
-        const cacheKey = `seo-checklist-local-${clientId}`;
-        // Reload all tasks for this client from Supabase
-        const { data: taskData, error: taskError } = await supabase
-          .from("checklist_tasks")
-          .select("*")
-          .like("id", `${clientId}__%`);
-        if (!taskError && taskData) {
-          let cached = [];
-          try { cached = JSON.parse(localStorage.getItem(cacheKey) || "[]"); } catch {}
-          const updatedCache = cached.map((t) => {
-            const fresh = taskData.find((r) => r.id === t.id);
-            if (!fresh) return t;
-            return {
-              ...t,
-              completed: fresh.completed ?? t.completed,
-              status: fresh.status ?? t.status,
-              totalSeconds: fresh.total_seconds ?? t.totalSeconds,
-              notes: fresh.notes ?? t.notes,
-              suspended: fresh.suspended ?? t.suspended,
-            };
-          });
-          localStorage.setItem(cacheKey, JSON.stringify(updatedCache));
-          setTaskSyncTick((n) => n + 1);
-        }
-      })
+
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
@@ -1553,26 +1532,20 @@ function ClientList({ onSelect }) {
     setEditingId(null);
   };
 
-  // ── Read per-client stats from localStorage ──
+  // ── Read per-client stats from React state (populated from Supabase) ──
   const getClientStats = (client) => {
+    const stats = taskStats[client.id];
+    if (stats) return { ...stats, staleTasks: [] };
+    // Fallback to localStorage while Supabase loads
     try {
       const state = JSON.parse(localStorage.getItem(`seo-checklist-local-${client.id}`)) || [];
       const struct = JSON.parse(localStorage.getItem(`seo-checklist-structure-${client.id}`));
       const totalTasks = struct ? struct.reduce((a, s) => a + s.tasks.length, 0) : state.length;
       const completed = state.filter((t) => t.completed).length;
-      const inProgress = state.filter((t) => t.status === "In corso").length;
-      const suspended = state.filter((t) => t.suspended).length;
+      const inProgress = state.filter((t) => t.status === "In corso" && !t.completed).length;
+      const suspended = state.filter((t) => t.suspended && !t.completed).length;
       const totalSeconds = state.reduce((a, t) => a + (t.totalSeconds || 0), 0);
-      // Tasks "in corso" da troppo tempo: status In corso ma non completato
-      // We track this via a separate key per task: seo-task-started-{clientId}-{taskId}
-      const staleTasks = state.filter((t) => {
-        if (t.status !== "In corso" || t.completed) return false;
-        const startedKey = localStorage.getItem(`seo-task-started-${client.id}-${t.id}`);
-        if (!startedKey) return false;
-        const daysSince = Math.floor((new Date() - new Date(startedKey)) / 86400000);
-        return daysSince >= 3;
-      });
-      return { totalTasks, completed, inProgress, suspended, totalSeconds, staleTasks, hasData: state.length > 0 };
+      return { totalTasks, completed, inProgress, suspended, totalSeconds, staleTasks: [], hasData: state.length > 0 };
     } catch { return { totalTasks: 0, completed: 0, inProgress: 0, suspended: 0, totalSeconds: 0, staleTasks: [], hasData: false }; }
   };
 
@@ -1836,14 +1809,52 @@ function ClientList({ onSelect }) {
 // ─── ROOT APP ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [selectedClient, setSelectedClient] = useState(null);
+  const [taskStats, setTaskStats] = useState({}); // { [clientId]: stats } — lives here so it survives navigation
+
+  const updateStatsForClient = async (clientId) => {
+    const { data } = await supabase.from("checklist_tasks").select("*").like("id", `${clientId}__%`);
+    if (data) {
+      const totalTasks = data.length;
+      const completed = data.filter((r) => r.completed).length;
+      const inProgress = data.filter((r) => r.status === "In corso" && !r.completed).length;
+      const suspended = data.filter((r) => r.suspended && !r.completed).length;
+      const totalSeconds = data.reduce((a, r) => a + (r.total_seconds || 0), 0);
+      setTaskStats((prev) => ({
+        ...prev,
+        [clientId]: { totalTasks, completed, inProgress, suspended, totalSeconds, hasData: totalTasks > 0 },
+      }));
+      // Keep localStorage in sync for ProjectApp
+      localStorage.setItem(`seo-checklist-local-${clientId}`, JSON.stringify(
+        data.map((r) => ({ id: r.id, completed: r.completed ?? false, status: r.status ?? "Da fare", totalSeconds: r.total_seconds ?? 0, notes: r.notes ?? "", suspended: r.suspended ?? false }))
+      ));
+    }
+  };
+
+  // Global realtime subscription — lives at root so it's never unmounted
+  useEffect(() => {
+    const channel = supabase
+      .channel("global-tasks-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "checklist_tasks" }, async (payload) => {
+        const changedRow = payload.new || payload.old;
+        if (!changedRow || !changedRow.id) return;
+        const parts = changedRow.id.split("__");
+        if (parts.length < 2) return;
+        await updateStatsForClient(parts[0]);
+      })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, []);
 
   if (!selectedClient) {
-    return <ClientList onSelect={(client) => {
-      // Sync client-level dates to per-client localStorage keys so ProjectApp picks them up
-      if (client.startDate) localStorage.setItem(`seo-startdate-local-${client.id}`, client.startDate);
-      if (client.deadline) localStorage.setItem(`seo-deadline-local-${client.id}`, client.deadline);
-      setSelectedClient(client);
-    }} />;
+    return <ClientList
+      taskStats={taskStats}
+      setTaskStats={setTaskStats}
+      onSelect={(client) => {
+        if (client.startDate) localStorage.setItem(`seo-startdate-local-${client.id}`, client.startDate);
+        if (client.deadline) localStorage.setItem(`seo-deadline-local-${client.id}`, client.deadline);
+        setSelectedClient(client);
+      }}
+    />;
   }
 
   return <ProjectApp client={selectedClient} onBack={() => setSelectedClient(null)} />;

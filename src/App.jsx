@@ -1323,8 +1323,8 @@ function ClientList({ onSelect }) {
       if (error) {
         console.error("Supabase clients load error:", error.message, error.code, error.details);
       }
-      if (data && data.length > 0) {
-        const mapped = data.map((r) => ({
+      if (!error) {
+        const mapped = (data || []).map((r) => ({
           id: r.id,
           name: r.name,
           createdAt: r.created_at,
@@ -1333,8 +1333,7 @@ function ClientList({ onSelect }) {
           startDate: r.start_date || null,
         }));
         saveClientsLocal(mapped);
-      } else if (error) {
-        // fallback to localStorage on error — already loaded via useState(loadClients)
+      } else {
         console.warn("Using localStorage fallback for clients");
       }
       setLoadingClients(false);
@@ -1537,7 +1536,7 @@ function ClientList({ onSelect }) {
             setLoadingClients(true);
             const { data, error } = await supabase.from("clients").select("*").order("created_at");
             if (error) console.error("Refresh error:", error.message);
-            if (data && data.length > 0) {
+            if (!error) {
               const mapped = data.map((r) => ({ id: r.id, name: r.name, createdAt: r.created_at, publishedDate: r.published_date || null, deadline: r.deadline || null, startDate: r.start_date || null }));
               saveClientsLocal(mapped);
             }

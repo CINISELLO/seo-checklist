@@ -349,18 +349,28 @@ function ProjectApp({ client, onBack }) {
     if (!localStorage.getItem(key)) {
       localStorage.setItem(key, new Date().toISOString());
     }
-    updateAndSave(id, { timerRunning: true, status: "In corso" });
+    updateAndSave(id, { timerRunning: true, status: "In corso", suspended: false });
   };
   const pauseTimer = (id) => {
     setTasks((prev) => {
       const t = prev.find((x) => x.id === id);
       const newTotal = t.totalSeconds + t.sessionSeconds;
-      const next = prev.map((x) => x.id === id ? { ...x, timerRunning: false, totalSeconds: newTotal, sessionSeconds: 0 } : x);
-      saveTaskState(id, { timerRunning: false, totalSeconds: newTotal, sessionSeconds: 0 }, next);
+      // Pausing also marks the task as suspended so it appears in the "Sospese" section
+      const next = prev.map((x) => x.id === id ? { ...x, timerRunning: false, totalSeconds: newTotal, sessionSeconds: 0, suspended: true, status: "In corso" } : x);
+      saveTaskState(id, { timerRunning: false, totalSeconds: newTotal, sessionSeconds: 0, suspended: true, status: "In corso" }, next);
       return next;
     });
   };
-  const stopTimer = pauseTimer;
+  const stopTimer = (id) => {
+    setTasks((prev) => {
+      const t = prev.find((x) => x.id === id);
+      const newTotal = t.totalSeconds + t.sessionSeconds;
+      // Stop (unlike pause) removes the suspended flag
+      const next = prev.map((x) => x.id === id ? { ...x, timerRunning: false, totalSeconds: newTotal, sessionSeconds: 0, suspended: false } : x);
+      saveTaskState(id, { timerRunning: false, totalSeconds: newTotal, sessionSeconds: 0, suspended: false }, next);
+      return next;
+    });
+  };
   const resetTimer = (id) => {
     setTasks((prev) => {
       const next = prev.map((x) => x.id === id ? { ...x, timerRunning: false, totalSeconds: 0, sessionSeconds: 0 } : x);
@@ -1040,7 +1050,7 @@ function ProjectApp({ client, onBack }) {
                               </div>
                               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                                 {[
-                                  { l: "▶ Avvia", fn: () => startTimer(task.id), bg: "rgba(52,211,153,0.15)", c: "#6ee7b7", bo: "rgba(52,211,153,0.3)" },
+                                  { l: task.suspended ? "▶ Riprendi" : "▶ Avvia", fn: () => startTimer(task.id), bg: "rgba(52,211,153,0.15)", c: "#6ee7b7", bo: "rgba(52,211,153,0.3)" },
                                   { l: "⏸ Pausa", fn: () => pauseTimer(task.id), bg: "rgba(251,191,36,0.15)", c: "#fcd34d", bo: "rgba(251,191,36,0.3)" },
                                   { l: "⏹ Stop", fn: () => stopTimer(task.id), bg: "rgba(251,113,133,0.15)", c: "#fda4af", bo: "rgba(251,113,133,0.3)" },
                                   { l: "↺", fn: () => resetTimer(task.id), bg: "rgba(255,255,255,0.05)", c: "#71717a", bo: "rgba(255,255,255,0.1)" },
@@ -1334,6 +1344,46 @@ function ClientList({ onSelect }) {
           startDate: r.start_date || null,
         }));
         saveClientsLocal(mapped);
+
+        // Also load task state from Supabase for all clients so stats are accurate on all devices
+        const { data: taskData } = await supabase.from("checklist_tasks").select("*");
+        if (taskData && taskData.length > 0) {
+          // Group tasks by matching them against each client's cached structure
+          for (const c of mapped) {
+            const cacheKey = `seo-checklist-local-${c.id}`;
+            let cached = [];
+            try { cached = JSON.parse(localStorage.getItem(cacheKey) || "[]"); } catch {}
+            if (cached.length === 0) {
+              // No local cache — try to build from structure
+              let struct = null;
+              try { struct = JSON.parse(localStorage.getItem(`seo-checklist-structure-${c.id}`) || "null"); } catch {}
+              if (struct) {
+                cached = struct.flatMap((section, si) =>
+                  section.tasks.map((task, ti) => ({
+                    id: task.id || `${si}-${ti}`,
+                    completed: false, status: "Da fare", totalSeconds: 0, notes: "", suspended: false,
+                  }))
+                );
+              }
+            }
+            if (cached.length > 0) {
+              const updated = cached.map((t) => {
+                const fresh = taskData.find((r) => r.id === t.id);
+                if (!fresh) return t;
+                return {
+                  ...t,
+                  completed: fresh.completed ?? t.completed,
+                  status: fresh.status ?? t.status,
+                  totalSeconds: fresh.total_seconds ?? t.totalSeconds,
+                  notes: fresh.notes ?? t.notes,
+                  suspended: fresh.suspended ?? t.suspended,
+                };
+              });
+              localStorage.setItem(cacheKey, JSON.stringify(updated));
+            }
+          }
+          setTaskSyncTick((n) => n + 1);
+        }
       } else {
         console.warn("Using localStorage fallback for clients");
       }

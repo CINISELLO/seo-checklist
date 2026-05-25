@@ -1345,10 +1345,11 @@ function ClientList({ onSelect }) {
     const channel = supabase
       .channel("clients-realtime")
       .on("postgres_changes", { event: "*", schema: "public", table: "clients" }, async () => {
-        // Reload all clients from Supabase when any change is detected
-        const { data } = await supabase.from("clients").select("*").order("created_at");
-        if (data && data.length > 0) {
-          const mapped = data.map((r) => ({
+        // Reload all clients from Supabase when any change is detected (including deletions)
+        const { data, error } = await supabase.from("clients").select("*").order("created_at");
+        if (!error) {
+          // Update even if data is empty (all clients deleted) or reduced (one deleted)
+          const mapped = (data || []).map((r) => ({
             id: r.id,
             name: r.name,
             createdAt: r.created_at,
@@ -1411,8 +1412,10 @@ function ClientList({ onSelect }) {
 
   const deleteClient = async (id) => {
     if (!window.confirm("Eliminare questo cliente? I dati locali rimarranno ma non sarà più visibile.")) return;
+    // Aggiorna subito lo stato locale per UI reattiva
     const newList = clients.filter((c) => c.id !== id);
-    await saveClientsRemote(newList);
+    saveClientsLocal(newList);
+    // Elimina da Supabase — il realtime sincronizzerà gli altri dispositivi
     await supabase.from("clients").delete().eq("id", id);
   };
 

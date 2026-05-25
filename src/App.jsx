@@ -223,6 +223,11 @@ function ProjectApp({ client, onBack }) {
         return map;
       });
 
+      // If structure was not in Supabase yet, save it now so stats are correct on all devices
+      if (!structData || structData.length === 0) {
+        await saveStructureToSupabase(resolvedStructure);
+      }
+
       const dl = localStorage.getItem(`seo-deadline-local-${client.id}`);
       if (dl) setDeadline(dl);
       const sd = localStorage.getItem(`seo-startdate-local-${client.id}`);

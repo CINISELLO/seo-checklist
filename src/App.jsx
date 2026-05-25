@@ -1315,6 +1315,7 @@ function ClientList({ onSelect }) {
   const [newStartDate, setNewStartDate] = useState("");
   const [newDeadline, setNewDeadline] = useState("");
   const [saving, setSaving] = useState(false);
+  const [taskSyncTick, setTaskSyncTick] = useState(0); // bumped when remote task changes arrive
 
   // ── Load clients from Supabase on mount, merge with localStorage ──
   useEffect(() => {
@@ -1347,7 +1348,6 @@ function ClientList({ onSelect }) {
         // Reload all clients from Supabase when any change is detected (including deletions)
         const { data, error } = await supabase.from("clients").select("*").order("created_at");
         if (!error) {
-          // Update even if data is empty (all clients deleted) or reduced (one deleted)
           const mapped = (data || []).map((r) => ({
             id: r.id,
             name: r.name,
@@ -1357,6 +1357,46 @@ function ClientList({ onSelect }) {
             startDate: r.start_date || null,
           }));
           saveClientsLocal(mapped);
+        }
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "checklist_tasks" }, async (payload) => {
+        // When a task changes on another device, update the local task cache so stats refresh
+        const changedRow = payload.new || payload.old;
+        if (!changedRow) return;
+        // We need to find which client this task belongs to.
+        // Tasks are keyed by id (e.g. "0-0", "1-2") — we check all client localStorage caches.
+        const allClients = JSON.parse(localStorage.getItem("seo-clients-list") || "[]");
+        for (const c of allClients) {
+          const cacheKey = `seo-checklist-local-${c.id}`;
+          let cached = [];
+          try { cached = JSON.parse(localStorage.getItem(cacheKey) || "[]"); } catch {}
+          const idx = cached.findIndex((t) => t.id === changedRow.id);
+          if (idx !== -1 || payload.eventType === "INSERT") {
+            // Reload all tasks for this client from Supabase
+            const { data: taskData, error: taskError } = await supabase
+              .from("checklist_tasks")
+              .select("*");
+            if (!taskError && taskData) {
+              // We can't know which tasks belong to which client without a client_id column,
+              // so we update any cached task that matches an id found in taskData
+              const updatedCache = cached.map((t) => {
+                const fresh = taskData.find((r) => r.id === t.id);
+                if (!fresh) return t;
+                return {
+                  ...t,
+                  completed: fresh.completed ?? t.completed,
+                  status: fresh.status ?? t.status,
+                  totalSeconds: fresh.total_seconds ?? t.totalSeconds,
+                  notes: fresh.notes ?? t.notes,
+                  suspended: fresh.suspended ?? t.suspended,
+                };
+              });
+              localStorage.setItem(cacheKey, JSON.stringify(updatedCache));
+            }
+            // Force re-render of ClientList by bumping a counter
+            setTaskSyncTick((n) => n + 1);
+            break;
+          }
         }
       })
       .subscribe();

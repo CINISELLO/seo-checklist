@@ -24,22 +24,27 @@ const PHASE_COLORS = [
 ];
 
 // ─── STRUCTURE HELPERS ─────────────────────────────────────────────────────────
-function buildTasksFromStructure(structure) {
+function buildTasksFromStructure(structure, clientId) {
   return structure.flatMap((section, si) =>
-    section.tasks.map((task, ti) => ({
-      id: task.id || `${si}-${ti}`,
-      phase: section.phase,
-      title: task.title,
-      description: task.description,
-      practicalGuide: task.practicalGuide || null,
-      completed: false,
-      status: "Da fare",
-      timerRunning: false,
-      sessionSeconds: 0,
-      totalSeconds: 0,
-      notes: "",
-      suspended: false,
-    }))
+    section.tasks.map((task, ti) => {
+      // Use client-scoped IDs so tasks are isolated per client in Supabase
+      const baseId = task.id || `${si}-${ti}`;
+      const id = clientId ? `${clientId}__${baseId}` : baseId;
+      return {
+        id,
+        phase: section.phase,
+        title: task.title,
+        description: task.description,
+        practicalGuide: task.practicalGuide || null,
+        completed: false,
+        status: "Da fare",
+        timerRunning: false,
+        sessionSeconds: 0,
+        totalSeconds: 0,
+        notes: "",
+        suspended: false,
+      };
+    })
   );
 }
 
@@ -111,7 +116,8 @@ function ProjectApp({ client, onBack }) {
   // Structure = ordered phases + task definitions (title/desc/guide/id)
   const [structure, setStructure] = useState(DEFAULT_CHECKLIST);
   // Tasks = runtime state (completed, timer, notes, etc.)
-  const [tasks, setTasks] = useState(() => buildTasksFromStructure(DEFAULT_CHECKLIST));
+  // client.id not available at useState init — tasks will be set properly in load()
+  const [tasks, setTasks] = useState([]);
 
   const [search, setSearch] = useState("");
   const [searchResultIndex, setSearchResultIndex] = useState(0);
@@ -142,17 +148,34 @@ function ProjectApp({ client, onBack }) {
     async function load() {
       setSyncStatus("syncing");
 
-      // 1. Try Supabase for structure
+      // ── MIGRATION: rename old unscoped IDs to client-scoped IDs ──
+      // Old IDs: "0-0", "1-2" → New IDs: "client-123__0-0", "client-123__1-2"
+      const migKey = `seo-migrated-v2-${client.id}`;
+      if (!localStorage.getItem(migKey)) {
+        const { data: oldTasks } = await supabase
+          .from("checklist_tasks").select("id").not("id", "like", `${client.id}__%`);
+        if (oldTasks && oldTasks.length > 0) {
+          // These are old unscoped tasks — delete them (they're shared/stale)
+          // We don't migrate them because we can't know which client they belonged to
+          // Each client will start fresh with properly scoped IDs
+          console.log(`Migration: found ${oldTasks.length} unscoped tasks, ignoring them`);
+        }
+        localStorage.setItem(migKey, "1");
+      }
+
+      // 1. Try Supabase for structure — filtered by client
       const { data: structData } = await supabase
         .from("checklist_structure")
         .select("*")
+        .like("id", `${client.id}__%`)
         .order("phase_index")
         .order("task_index");
 
-      // 2. Try Supabase for task state
+      // 2. Try Supabase for task state — filtered by client
       const { data: stateData, error: stateError } = await supabase
         .from("checklist_tasks")
-        .select("*");
+        .select("*")
+        .like("id", `${client.id}__%`);
 
       let resolvedStructure = DEFAULT_CHECKLIST;
       let resolvedState = [];
@@ -195,7 +218,7 @@ function ProjectApp({ client, onBack }) {
       }
 
       setStructure(resolvedStructure);
-      const fresh = buildTasksFromStructure(resolvedStructure);
+      const fresh = buildTasksFromStructure(resolvedStructure, client.id);
       setTasks(fresh.map((f) => {
         const s = resolvedState.find((r) => r.id === f.id);
         if (!s) return f;
@@ -382,14 +405,15 @@ function ProjectApp({ client, onBack }) {
   // ─── SAVE STRUCTURE ───────────────────────────────────────────────────────────
   const saveStructureToSupabase = async (newStructure) => {
     setSyncStatus("syncing");
-    // Delete all existing structure rows
-    await supabase.from("checklist_structure").delete().neq("id", "___never___");
-    // Insert new rows
+    // Delete only THIS client's structure rows
+    await supabase.from("checklist_structure").delete().like("id", `${client.id}__%`);
+    // Insert new rows with client-scoped IDs
     const rows = [];
     newStructure.forEach((section, si) => {
       section.tasks.forEach((task, ti) => {
+        const baseId = task.id ? task.id.replace(`${client.id}__`, "") : `${si}-${ti}`;
         rows.push({
-          id: task.id,
+          id: `${client.id}__${baseId}`,
           phase: section.phase,
           phase_index: si,
           task_index: ti,
@@ -413,7 +437,7 @@ function ProjectApp({ client, onBack }) {
   // ─── EDIT MODE ACTIONS ────────────────────────────────────────────────────────
   const applyStructureChange = async (newStructure) => {
     // Merge task state into new structure
-    const fresh = buildTasksFromStructure(newStructure);
+    const fresh = buildTasksFromStructure(newStructure, client.id);
     const merged = fresh.map((f) => {
       const existing = tasks.find((t) => t.id === f.id);
       return existing ? { ...f, ...existing, id: f.id, title: f.title, description: f.description, practicalGuide: f.practicalGuide } : f;
@@ -512,7 +536,7 @@ function ProjectApp({ client, onBack }) {
         return;
       }
       const newStructure = parsed.structure;
-      const fresh = buildTasksFromStructure(newStructure);
+      const fresh = buildTasksFromStructure(newStructure, client.id);
       const stateMap = {};
       (parsed.taskState || []).forEach((s) => { stateMap[s.id] = s; });
       const merged = fresh.map((f) => {
@@ -1410,43 +1434,36 @@ function ClientList({ onSelect }) {
         }
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "checklist_tasks" }, async (payload) => {
-        // When a task changes on another device, update the local task cache so stats refresh
+        // Task IDs are prefixed with client_id (e.g. "client-123__0-1")
+        // so we can extract the client directly from the changed row ID
         const changedRow = payload.new || payload.old;
-        if (!changedRow) return;
-        // We need to find which client this task belongs to.
-        // Tasks are keyed by id (e.g. "0-0", "1-2") — we check all client localStorage caches.
-        const allClients = JSON.parse(localStorage.getItem("seo-clients-list") || "[]");
-        for (const c of allClients) {
-          const cacheKey = `seo-checklist-local-${c.id}`;
+        if (!changedRow || !changedRow.id) return;
+        const parts = changedRow.id.split("__");
+        if (parts.length < 2) return;
+        const clientId = parts[0];
+        const cacheKey = `seo-checklist-local-${clientId}`;
+        // Reload all tasks for this client from Supabase
+        const { data: taskData, error: taskError } = await supabase
+          .from("checklist_tasks")
+          .select("*")
+          .like("id", `${clientId}__%`);
+        if (!taskError && taskData) {
           let cached = [];
           try { cached = JSON.parse(localStorage.getItem(cacheKey) || "[]"); } catch {}
-          const idx = cached.findIndex((t) => t.id === changedRow.id);
-          if (idx !== -1 || payload.eventType === "INSERT") {
-            // Reload all tasks for this client from Supabase
-            const { data: taskData, error: taskError } = await supabase
-              .from("checklist_tasks")
-              .select("*");
-            if (!taskError && taskData) {
-              // We can't know which tasks belong to which client without a client_id column,
-              // so we update any cached task that matches an id found in taskData
-              const updatedCache = cached.map((t) => {
-                const fresh = taskData.find((r) => r.id === t.id);
-                if (!fresh) return t;
-                return {
-                  ...t,
-                  completed: fresh.completed ?? t.completed,
-                  status: fresh.status ?? t.status,
-                  totalSeconds: fresh.total_seconds ?? t.totalSeconds,
-                  notes: fresh.notes ?? t.notes,
-                  suspended: fresh.suspended ?? t.suspended,
-                };
-              });
-              localStorage.setItem(cacheKey, JSON.stringify(updatedCache));
-            }
-            // Force re-render of ClientList by bumping a counter
-            setTaskSyncTick((n) => n + 1);
-            break;
-          }
+          const updatedCache = cached.map((t) => {
+            const fresh = taskData.find((r) => r.id === t.id);
+            if (!fresh) return t;
+            return {
+              ...t,
+              completed: fresh.completed ?? t.completed,
+              status: fresh.status ?? t.status,
+              totalSeconds: fresh.total_seconds ?? t.totalSeconds,
+              notes: fresh.notes ?? t.notes,
+              suspended: fresh.suspended ?? t.suspended,
+            };
+          });
+          localStorage.setItem(cacheKey, JSON.stringify(updatedCache));
+          setTaskSyncTick((n) => n + 1);
         }
       })
       .subscribe();
@@ -1500,12 +1517,20 @@ function ClientList({ onSelect }) {
   };
 
   const deleteClient = async (id) => {
-    if (!window.confirm("Eliminare questo cliente? I dati locali rimarranno ma non sarà più visibile.")) return;
+    if (!window.confirm("Eliminare questo cliente? Tutti i dati verranno rimossi.")) return;
     // Aggiorna subito lo stato locale per UI reattiva
     const newList = clients.filter((c) => c.id !== id);
     saveClientsLocal(newList);
-    // Elimina da Supabase — il realtime sincronizzerà gli altri dispositivi
+    // Remove task state and structure for this client from Supabase
+    await supabase.from("checklist_tasks").delete().like("id", `${id}__%`);
+    await supabase.from("checklist_structure").delete().like("id", `${id}__%`);
+    // Remove from clients table — realtime will sync other devices
     await supabase.from("clients").delete().eq("id", id);
+    // Clean up localStorage for this client
+    localStorage.removeItem(`seo-checklist-local-${id}`);
+    localStorage.removeItem(`seo-checklist-structure-${id}`);
+    localStorage.removeItem(`seo-startdate-local-${id}`);
+    localStorage.removeItem(`seo-deadline-local-${id}`);
   };
 
   const setPublishedDate = async (id, date) => {

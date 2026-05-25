@@ -148,21 +148,6 @@ function ProjectApp({ client, onBack }) {
     async function load() {
       setSyncStatus("syncing");
 
-      // ── MIGRATION: rename old unscoped IDs to client-scoped IDs ──
-      // Old IDs: "0-0", "1-2" → New IDs: "client-123__0-0", "client-123__1-2"
-      const migKey = `seo-migrated-v2-${client.id}`;
-      if (!localStorage.getItem(migKey)) {
-        const { data: oldTasks } = await supabase
-          .from("checklist_tasks").select("id").not("id", "like", `${client.id}__%`);
-        if (oldTasks && oldTasks.length > 0) {
-          // These are old unscoped tasks — delete them (they're shared/stale)
-          // We don't migrate them because we can't know which client they belonged to
-          // Each client will start fresh with properly scoped IDs
-          console.log(`Migration: found ${oldTasks.length} unscoped tasks, ignoring them`);
-        }
-        localStorage.setItem(migKey, "1");
-      }
-
       // 1. Try Supabase for structure — filtered by client
       const { data: structData } = await supabase
         .from("checklist_structure")
@@ -1349,19 +1334,6 @@ function ClientList({ onSelect, taskStats = {}, setTaskStats = () => {} }) {
   const [newStartDate, setNewStartDate] = useState("");
   const [newDeadline, setNewDeadline] = useState("");
   const [saving, setSaving] = useState(false);
-  // ── Compute stats from raw Supabase rows and store in React state ──
-  const updateStatsFromRows = (clientId, rows) => {
-    const totalTasks = rows.length;
-    const completed = rows.filter((r) => r.completed).length;
-    const inProgress = rows.filter((r) => r.status === "In corso" && !r.completed).length;
-    const suspended = rows.filter((r) => r.suspended && !r.completed).length;
-    const totalSeconds = rows.reduce((a, r) => a + (r.total_seconds || 0), 0);
-    setTaskStats((prev) => ({
-      ...prev,
-      [clientId]: { totalTasks, completed, inProgress, suspended, totalSeconds, hasData: totalTasks > 0 },
-    }));
-  };
-
   // ── Load clients from Supabase on mount, merge with localStorage ──
   useEffect(() => {
     async function loadFromSupabase() {
@@ -1379,46 +1351,6 @@ function ClientList({ onSelect, taskStats = {}, setTaskStats = () => {} }) {
           startDate: r.start_date || null,
         }));
         saveClientsLocal(mapped);
-
-        // Also load task state from Supabase for all clients so stats are accurate on all devices
-        const { data: taskData } = await supabase.from("checklist_tasks").select("*");
-        if (taskData && taskData.length > 0) {
-          // Group tasks by matching them against each client's cached structure
-          for (const c of mapped) {
-            const cacheKey = `seo-checklist-local-${c.id}`;
-            let cached = [];
-            try { cached = JSON.parse(localStorage.getItem(cacheKey) || "[]"); } catch {}
-            if (cached.length === 0) {
-              // No local cache — try to build from structure
-              let struct = null;
-              try { struct = JSON.parse(localStorage.getItem(`seo-checklist-structure-${c.id}`) || "null"); } catch {}
-              if (struct) {
-                cached = struct.flatMap((section, si) =>
-                  section.tasks.map((task, ti) => ({
-                    id: task.id || `${si}-${ti}`,
-                    completed: false, status: "Da fare", totalSeconds: 0, notes: "", suspended: false,
-                  }))
-                );
-              }
-            }
-            if (cached.length > 0) {
-              const updated = cached.map((t) => {
-                const fresh = taskData.find((r) => r.id === t.id);
-                if (!fresh) return t;
-                return {
-                  ...t,
-                  completed: fresh.completed ?? t.completed,
-                  status: fresh.status ?? t.status,
-                  totalSeconds: fresh.total_seconds ?? t.totalSeconds,
-                  notes: fresh.notes ?? t.notes,
-                  suspended: fresh.suspended ?? t.suspended,
-                };
-              });
-              localStorage.setItem(cacheKey, JSON.stringify(updated));
-            }
-          }
-
-        }
       } else {
         console.warn("Using localStorage fallback for clients");
       }
@@ -1532,10 +1464,10 @@ function ClientList({ onSelect, taskStats = {}, setTaskStats = () => {} }) {
     setEditingId(null);
   };
 
-  // ── Read per-client stats from React state (populated from Supabase) ──
+  // ── Read per-client stats from React state (populated from Supabase on mount + realtime) ──
   const getClientStats = (client) => {
     const stats = taskStats[client.id];
-    if (stats) return { ...stats, staleTasks: [] };
+    if (stats) return stats;
     // Fallback to localStorage while Supabase loads
     try {
       const state = JSON.parse(localStorage.getItem(`seo-checklist-local-${client.id}`)) || [];
@@ -1545,8 +1477,8 @@ function ClientList({ onSelect, taskStats = {}, setTaskStats = () => {} }) {
       const inProgress = state.filter((t) => t.status === "In corso" && !t.completed).length;
       const suspended = state.filter((t) => t.suspended && !t.completed).length;
       const totalSeconds = state.reduce((a, t) => a + (t.totalSeconds || 0), 0);
-      return { totalTasks, completed, inProgress, suspended, totalSeconds, staleTasks: [], hasData: state.length > 0 };
-    } catch { return { totalTasks: 0, completed: 0, inProgress: 0, suspended: 0, totalSeconds: 0, staleTasks: [], hasData: false }; }
+      return { totalTasks, completed, inProgress, suspended, totalSeconds, hasData: state.length > 0 };
+    } catch { return { totalTasks: 0, completed: 0, inProgress: 0, suspended: 0, totalSeconds: 0, hasData: false }; }
   };
 
   // ── Deadline helpers ──
@@ -1576,10 +1508,8 @@ function ClientList({ onSelect, taskStats = {}, setTaskStats = () => {} }) {
   const getAlerts = (client) => {
     const alerts = [];
     const dtd = daysToDeadline(client);
-    const stats = getClientStats(client);
     if (dtd !== null && dtd < 0) alerts.push({ type: "danger", msg: `Scadenza superata di ${Math.abs(dtd)} giorni` });
     else if (dtd !== null && dtd <= 5) alerts.push({ type: "warning", msg: `Scadenza tra ${dtd} giorni` });
-    if (stats.staleTasks.length > 0) alerts.push({ type: "warning", msg: `${stats.staleTasks.length} task in corso da 3+ giorni` });
     if (needsAnalytics(client)) alerts.push({ type: "analytics", msg: `Analytics mensile — ${daysSincePublish(client)}g dalla pubblicazione` });
     return alerts;
   };
@@ -1812,34 +1742,77 @@ export default function App() {
   const [taskStats, setTaskStats] = useState({}); // { [clientId]: stats } — lives here so it survives navigation
 
   const updateStatsForClient = async (clientId) => {
-    const { data } = await supabase.from("checklist_tasks").select("*").like("id", `${clientId}__%`);
-    if (data) {
-      const totalTasks = data.length;
-      const completed = data.filter((r) => r.completed).length;
-      const inProgress = data.filter((r) => r.status === "In corso" && !r.completed).length;
-      const suspended = data.filter((r) => r.suspended && !r.completed).length;
-      const totalSeconds = data.reduce((a, r) => a + (r.total_seconds || 0), 0);
+    const [{ data: taskData }, { data: structData }] = await Promise.all([
+      supabase.from("checklist_tasks").select("*").like("id", `${clientId}__%`),
+      supabase.from("checklist_structure").select("id").like("id", `${clientId}__%`),
+    ]);
+    if (taskData !== null) {
+      // totalTasks comes from structure (all tasks), not from checklist_tasks (only touched tasks)
+      const totalTasks = structData ? structData.length : taskData.length;
+      const completed = taskData.filter((r) => r.completed).length;
+      const inProgress = taskData.filter((r) => r.status === "In corso" && !r.completed).length;
+      const suspended = taskData.filter((r) => r.suspended && !r.completed).length;
+      const totalSeconds = taskData.reduce((a, r) => a + (r.total_seconds || 0), 0);
       setTaskStats((prev) => ({
         ...prev,
         [clientId]: { totalTasks, completed, inProgress, suspended, totalSeconds, hasData: totalTasks > 0 },
       }));
-      // Keep localStorage in sync for ProjectApp
       localStorage.setItem(`seo-checklist-local-${clientId}`, JSON.stringify(
-        data.map((r) => ({ id: r.id, completed: r.completed ?? false, status: r.status ?? "Da fare", totalSeconds: r.total_seconds ?? 0, notes: r.notes ?? "", suspended: r.suspended ?? false }))
+        taskData.map((r) => ({ id: r.id, completed: r.completed ?? false, status: r.status ?? "Da fare", totalSeconds: r.total_seconds ?? 0, notes: r.notes ?? "", suspended: r.suspended ?? false }))
       ));
     }
   };
 
-  // Global realtime subscription — lives at root so it's never unmounted
+  // Global realtime subscription + initial stats load — lives at root so it's never unmounted
   useEffect(() => {
+    // Load stats for ALL clients at startup (one query, no per-client round trips)
+    const loadAllStats = async () => {
+      const [{ data: taskData }, { data: structData }] = await Promise.all([
+        supabase.from("checklist_tasks").select("id,completed,status,total_seconds,suspended"),
+        supabase.from("checklist_structure").select("id"),
+      ]);
+      // Build a map of clientId → total task count from structure
+      const structByClient = {};
+      (structData || []).forEach((r) => {
+        const clientId = r.id.split("__")[0];
+        if (!clientId.startsWith("client-")) return;
+        structByClient[clientId] = (structByClient[clientId] || 0) + 1;
+      });
+      // Group task state by client
+      const byClient = {};
+      (taskData || []).forEach((r) => {
+        const clientId = r.id.split("__")[0];
+        if (!clientId.startsWith("client-")) return;
+        if (!byClient[clientId]) byClient[clientId] = [];
+        byClient[clientId].push(r);
+      });
+      // Merge: all clients that have a structure entry get stats
+      const allClientIds = new Set([...Object.keys(structByClient), ...Object.keys(byClient)]);
+      const stats = {};
+      allClientIds.forEach((cid) => {
+        const rows = byClient[cid] || [];
+        const totalTasks = structByClient[cid] || rows.length;
+        stats[cid] = {
+          totalTasks,
+          completed: rows.filter((r) => r.completed).length,
+          inProgress: rows.filter((r) => r.status === "In corso" && !r.completed).length,
+          suspended: rows.filter((r) => r.suspended && !r.completed).length,
+          totalSeconds: rows.reduce((a, r) => a + (r.total_seconds || 0), 0),
+          hasData: totalTasks > 0,
+        };
+      });
+      setTaskStats(stats);
+    };
+    loadAllStats();
+
     const channel = supabase
       .channel("global-tasks-realtime")
       .on("postgres_changes", { event: "*", schema: "public", table: "checklist_tasks" }, async (payload) => {
         const changedRow = payload.new || payload.old;
         if (!changedRow || !changedRow.id) return;
-        const parts = changedRow.id.split("__");
-        if (parts.length < 2) return;
-        await updateStatsForClient(parts[0]);
+        const clientId = changedRow.id.split("__")[0];
+        if (!clientId.startsWith("client-")) return;
+        await updateStatsForClient(clientId);
       })
       .subscribe();
     return () => { supabase.removeChannel(channel); };
